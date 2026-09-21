@@ -5,7 +5,7 @@
  *  - /quota: show subscription quota for every OAuth provider the proxy holds,
  *    fetched exactly like the EasyCLIProxyAPI panel does via the proxy management
  *    API `POST /v0/management/api-call`. Providers: claude + antigravity/gemini
- *    (verified), codex + kimi + xai (best-effort, marked (unverified)).
+ *    + kimi + codex (verified), xai (best-effort, marked (unverified)).
  *  - Footer quota display: automatically refreshed at turn start/end.
  *
  * No secrets in source. Management key is read at runtime from env,
@@ -138,6 +138,7 @@ export interface Win {
 	label: string;
 	remainingPct: number | null;
 	resetIso: string | null;
+	tag?: string;
 }
 
 function toNum(v: unknown): number | null {
@@ -322,9 +323,102 @@ const kimiAdapter: Adapter = {
 	},
 };
 
-// ---- codex (UNVERIFIED): GET chatgpt.com/backend-api/wham/usage ----
+// ---- codex (VERIFIED): GET chatgpt.com/backend-api/wham/usage ----
+export function codexWindowLabel(slot: string, winSecs: number | null): string {
+	if (winSecs !== null && winSecs > 0) {
+		if (winSecs === 18_000) return "5h";
+		if (winSecs === 604_800) return "weekly";
+		if (winSecs % 86_400 === 0) {
+			const d = winSecs / 86_400;
+			return d === 7 ? "weekly" : `${d}d`;
+		}
+		if (winSecs % 3_600 === 0) return `${winSecs / 3_600}h`;
+		if (winSecs % 60 === 0) return `${winSecs / 60}m`;
+		return `${winSecs}s`;
+	}
+	if (slot === "primary") return "5h";
+	if (slot === "secondary") return "weekly";
+	return slot;
+}
+
+export function parseCodexUsage(body: string, now = Date.now()): Win[] {
+	const data = JSON.parse(body) as Record<string, unknown>;
+	const wins: Win[] = [];
+	let rl = data.rate_limit as Record<string, unknown> | undefined;
+	if (!rl || typeof rl !== "object") {
+		rl = (data.rate_limits ?? data) as Record<string, unknown>;
+	}
+	const limitReached = rl.limit_reached === true || rl.limitReached === true || rl.allowed === false;
+	for (const [slot, legacy] of [
+		["primary_window", "primary"],
+		["secondary_window", "secondary"],
+	] as const) {
+		const r = (rl[slot] ?? rl[legacy]) as Record<string, unknown> | null | undefined;
+		if (!r || typeof r !== "object") continue;
+		const up = toNum(r.used_percent ?? r.usedPercent);
+		if (up === null) continue;
+		const secs = toNum(
+			r.reset_after_seconds ??
+			r.resets_in_seconds ??
+			r.resetsInSeconds ??
+			r.resetAfterSeconds,
+		);
+		let resetIso: string | null = null;
+		if (secs !== null && secs >= 0) {
+			resetIso = new Date(now + secs * 1000).toISOString();
+		} else {
+			const at = r.reset_at ?? r.resets_at ?? r.resetAt ?? r.resetsAt;
+			const atNum = toNum(at);
+			if (atNum !== null && atNum > 0) {
+				const ms = atNum < 1e11 ? atNum * 1000 : atNum;
+				resetIso = new Date(ms).toISOString();
+			} else {
+				resetIso = firstIso(at);
+			}
+		}
+		const winSecs = toNum(r.limit_window_seconds ?? r.limitWindowSeconds);
+		const slotName = slot.replace(/_window$/, "");
+		const label = codexWindowLabel(slotName, winSecs);
+		const winLimitReached =
+			r.limit_reached === true ||
+			r.limitReached === true ||
+			r.allowed === false ||
+			(limitReached && up >= 100);
+		const tag = winLimitReached ? "limit reached" : undefined;
+		wins.push({
+			label,
+			remainingPct: Math.max(0, 100 - up),
+			resetIso,
+			...(tag ? { tag } : {}),
+		});
+	}
+	if (limitReached && wins.length > 0 && !wins.some((w) => w.tag)) {
+		wins[0].tag = rl.allowed === false && rl.limit_reached !== true ? "blocked" : "limit reached";
+	}
+	const credsObj = (typeof data.credits === "object" && data.credits !== null ? data.credits : {}) as Record<string, unknown>;
+	const bp = toNum(
+		data.creditUsagePercent ??
+		data.credit_usage_percent ??
+		data.usagePercent ??
+		data.usage_percent ??
+		credsObj.used_percent ??
+		credsObj.usedPercent,
+	);
+	if (bp !== null) {
+		const cp = (data.currentPeriod ?? data.current_period) as Record<string, unknown> | undefined;
+		const credsLimitReached = credsObj.overage_limit_reached === true || bp >= 100;
+		wins.push({
+			label: "credits",
+			remainingPct: Math.max(0, 100 - bp),
+			resetIso: firstIso(cp?.end),
+			...(credsLimitReached ? { tag: "limit reached" } : {}),
+		});
+	}
+	return wins;
+}
+
 const codexAdapter: Adapter = {
-	verified: false,
+	verified: true,
 	async fetch(base, key, cred) {
 		const authIndex = cred.auth_index as string;
 		const body = await proxyCall(base, key, {
@@ -337,25 +431,7 @@ const codexAdapter: Adapter = {
 				"User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
 			},
 		});
-		const data = JSON.parse(body) as Record<string, unknown>;
-		const wins: Win[] = [];
-		const rl = (data.rate_limits ?? data) as Record<string, unknown>;
-		for (const slot of ["primary", "secondary"] as const) {
-			const r = rl[slot] as Record<string, unknown> | undefined;
-			const up = toNum(r?.used_percent ?? r?.usedPercent);
-			if (up === null) continue;
-			const secs = toNum(r?.resets_in_seconds ?? r?.resetsInSeconds);
-			const resetIso = secs !== null && secs > 0 ? new Date(Date.now() + secs * 1000).toISOString() : firstIso(r?.resets_at);
-			wins.push({ label: `rate ${slot}`, remainingPct: Math.max(0, 100 - up), resetIso });
-		}
-		const bp = toNum(
-			data.creditUsagePercent ?? data.credit_usage_percent ?? data.usagePercent ?? data.usage_percent,
-		);
-		if (bp !== null) {
-			const cp = (data.currentPeriod ?? data.current_period) as Record<string, unknown> | undefined;
-			wins.push({ label: "credits", remainingPct: Math.max(0, 100 - bp), resetIso: firstIso(cp?.end) });
-		}
-		return wins;
+		return parseCodexUsage(body);
 	},
 };
 
@@ -468,12 +544,13 @@ export function renderWindows(wins: Win[], now = Date.now()): string[] {
 	if (wins.length === 0) return ["  (no quota window data)"];
 	return wins.map((w) => {
 		const remain = w.remainingPct;
-		if (remain === null) return `  ${w.label.padEnd(22)} n/a · ${formatReset(w.resetIso, now)}`;
+		const tagStr = w.tag ? ` · ${w.tag}` : "";
+		if (remain === null) return `  ${w.label.padEnd(22)} n/a · ${formatReset(w.resetIso, now)}${tagStr}`;
 		const used = Math.max(0, 100 - remain);
 		// suppress when the displayed value rounds to 100%: upstream slides resetTime
 		// on untouched buckets (always now+window), so a countdown there is an illusion.
 		const resetStr = Math.round(remain) >= 100 ? "—" : formatReset(w.resetIso, now);
-		return `  ${w.label.padEnd(22)} ${bar(used)} ${used.toFixed(0)}% used · ${remain.toFixed(0)}% left · ${resetStr}`;
+		return `  ${w.label.padEnd(22)} ${bar(used)} ${used.toFixed(0)}% used · ${remain.toFixed(0)}% left · ${resetStr}${tagStr}`;
 	});
 }
 
@@ -505,7 +582,8 @@ export function summaryFromWins(wins: Win[], now = Date.now()): string {
 		if (w.remainingPct === null) continue;
 		const rounded = Math.round(w.remainingPct);
 		const reset = rounded >= 100 ? "" : compactReset(w.resetIso, now);
-		parts.push(`${shortTag(w.label)} ${rounded}% left${reset}`);
+		const tagStr = w.tag ? ` (${w.tag})` : "";
+		parts.push(`${shortTag(w.label)} ${rounded}% left${reset}${tagStr}`);
 	}
 	return parts.length ? `Quota ${parts.join(" · ")}` : "Quota n/a";
 }
