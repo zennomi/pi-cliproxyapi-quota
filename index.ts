@@ -640,7 +640,9 @@ export default function (pi: ExtensionAPI): void {
 		}
 	}
 
-	// Auto-refresh footer: first turn start + each turn end, throttled to 60s, silent.
+	// Auto-refresh footer on session load, first turn start, and each turn end.
+	// `before_agent_start` does not fire until after the first prompt, so it cannot
+	// populate the footer when pi first opens.
 	function refreshFooterThrottled(ctx: ExtensionContext): void {
 		if (!isPrimaryUiSession(ctx)) return;
 		const now = Date.now();
@@ -648,6 +650,7 @@ export default function (pi: ExtensionAPI): void {
 		lastFooterFetch = now;
 		void runQuota(ctx, true);
 	}
+	pi.on("session_start", (_e, ctx) => refreshFooterThrottled(ctx));
 	pi.on("before_agent_start", (_e, ctx) => refreshFooterThrottled(ctx));
 	pi.on("agent_settled", (_e, ctx) => refreshFooterThrottled(ctx));
 
