@@ -139,6 +139,7 @@ export interface Win {
 	remainingPct: number | null;
 	resetIso: string | null;
 	tag?: string;
+	group?: string;
 }
 
 function toNum(v: unknown): number | null {
@@ -217,7 +218,7 @@ const ANTIGRAVITY_HOSTS = [
 ];
 const ANTIGRAVITY_UA = "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)";
 
-function parseQuotaSummary(body: string): Win[] {
+export function parseQuotaSummary(body: string): Win[] {
 	const data = JSON.parse(body) as {
 		groups?: Array<{ displayName?: unknown; buckets?: Array<Record<string, unknown>> }>;
 	};
@@ -233,6 +234,7 @@ function parseQuotaSummary(body: string): Win[] {
 				label: `${gname} · ${tag}`,
 				remainingPct: Math.max(0, Math.min(100, frac * 100)),
 				resetIso: firstIso(b.resetTime),
+				group: gname,
 			});
 		}
 	}
@@ -475,6 +477,8 @@ export async function collectQuota(
 	key: string,
 	now = Date.now(),
 	prefer?: string | null,
+	theme?: FooterTheme,
+	model?: { provider?: string; id?: string } | string | null,
 ): Promise<{ blocks: string[]; footer: string }> {
 	const creds = await listCredentials(base, key);
 	const known = creds
@@ -492,7 +496,7 @@ export async function collectQuota(
 			const wins = await adapter.fetch(base, key, c);
 			blocks.push(`● ${who} [${pk}]${tag}`);
 			blocks.push(...renderWindows(wins, now));
-			const s = summaryFromWins(wins);
+			const s = summaryFromWins(wins, now, theme, model);
 			if (s !== "Quota n/a" && !summaries.has(pk)) summaries.set(pk, s);
 		} catch (err) {
 			blocks.push(`● ${who} [${pk}]${tag}\n  failed: ${(err as Error).message}`);
@@ -503,15 +507,11 @@ export async function collectQuota(
 	// so a fallback never masquerades as the active provider's quota.
 	const actual = prefer && summaries.has(prefer) ? prefer : [...summaries.keys()][0];
 	const hit = actual !== undefined ? summaries.get(actual) : undefined;
-	// Stamp the fetch time so a stale/frozen footer is visibly distinguishable
-	// from live data that simply hasn't moved.
-	const d = new Date(now);
-	const stamp = `@${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 	const footer =
 		hit && actual
 			? (summaries.size > 1 || actual !== prefer
 				? hit.replace("Quota ", `Quota[${actual}] `)
-				: hit) + ` ${stamp}`
+				: hit)
 			: "";
 	return { blocks, footer };
 }
@@ -575,17 +575,122 @@ function compactReset(iso: string | null, now: number): string {
 	return ` ↻${m}m`;
 }
 
-/** Compact one-line summary for the footer (first two windows). */
-export function summaryFromWins(wins: Win[], now = Date.now()): string {
+type FooterColor = "dim" | "success" | "warning" | "error";
+
+/** Minimal structural type so the pure formatter works without a runtime pi import. */
+interface FooterTheme {
+	fg(color: FooterColor, text: string): string;
+}
+
+function footerTone(remainingPct: number): FooterColor {
+	if (remainingPct <= 10) return "error";
+	if (remainingPct <= 30) return "warning";
+	return "success";
+}
+
+function compactMeter(remainingPct: number, theme?: FooterTheme, width = 6): string {
+	const filled = Math.round((remainingPct / 100) * width);
+	const full = "━".repeat(filled);
+	const empty = "─".repeat(width - filled);
+	if (!theme) return full + empty;
+	return (full ? theme.fg(footerTone(remainingPct), full) : "") + (empty ? theme.fg("dim", empty) : "");
+}
+
+function footerWindowRank(label: string): number {
+	const tag = shortTag(label);
+	if (tag === "5h") return 0;
+	if (tag === "7d" || tag === "7h") return 1;
+	return 2;
+}
+
+export function selectBestGroup(
+	wins: Win[],
+	model?: { provider?: string; id?: string } | string | null,
+): string | undefined {
+	const groups = [...new Set(wins.map((w) => w.group).filter((g): g is string => Boolean(g)))];
+	if (groups.length <= 1) return groups[0];
+
+	const modelStr = (typeof model === "string" ? model : `${model?.provider ?? ""} ${model?.id ?? ""}`).toLowerCase();
+	if (modelStr) {
+		if (modelStr.includes("claude") || modelStr.includes("gpt")) {
+			const match = groups.find((g) => {
+				const gl = g.toLowerCase();
+				return gl.includes("claude") || gl.includes("gpt");
+			});
+			if (match) return match;
+		}
+		if (modelStr.includes("gemini") || modelStr.includes("antigravity")) {
+			const match = groups.find((g) => g.toLowerCase().includes("gemini"));
+			if (match) return match;
+		}
+	}
+
+	// Prefer a group that has active usage (< 100% remaining), picking the most-used group
+	let bestUsed: { group: string; minRemain: number } | undefined;
+	for (const g of groups) {
+		const groupWins = wins.filter((w) => w.group === g && w.remainingPct !== null);
+		if (groupWins.length === 0) continue;
+		const minRemain = Math.min(...groupWins.map((w) => w.remainingPct as number));
+		if (minRemain < 100) {
+			if (!bestUsed || minRemain < bestUsed.minRemain) {
+				bestUsed = { group: g, minRemain };
+			}
+		}
+	}
+	if (bestUsed) return bestUsed.group;
+
+	return groups[0];
+}
+
+/** Compact one-line remaining-quota meter: 5h, then weekly/7d, then other windows. */
+export function summaryFromWins(
+	wins: Win[],
+	now = Date.now(),
+	theme?: FooterTheme,
+	model?: { provider?: string; id?: string } | string | null,
+): string {
+	const chosenGroup = selectBestGroup(wins, model);
+	const candidateWins = chosenGroup ? wins.filter((w) => w.group === chosenGroup) : wins;
+
+	const sorted = candidateWins
+		.map((w, index) => ({ w, index }))
+		.sort((a, b) => footerWindowRank(a.w.label) - footerWindowRank(b.w.label) || a.index - b.index);
+
+	const footerWins: Array<{ w: Win; index: number }> = [];
+	const seenTags = new Set<string>();
+	for (const item of sorted) {
+		const tag = shortTag(item.w.label);
+		if (seenTags.has(tag)) continue;
+		seenTags.add(tag);
+		footerWins.push(item);
+		if (footerWins.length >= 2) break;
+	}
+
+	if (footerWins.length < 2 && sorted.length > footerWins.length) {
+		for (const item of sorted) {
+			if (!footerWins.some((f) => f.index === item.index)) {
+				footerWins.push(item);
+				if (footerWins.length >= 2) break;
+			}
+		}
+	}
+
 	const parts: string[] = [];
-	for (const w of wins.slice(0, 2)) {
+	for (const { w } of footerWins) {
 		if (w.remainingPct === null) continue;
-		const rounded = Math.round(w.remainingPct);
+		const remaining = Math.max(0, Math.min(100, w.remainingPct));
+		const rounded = Math.round(remaining);
 		const reset = rounded >= 100 ? "" : compactReset(w.resetIso, now);
 		const tagStr = w.tag ? ` (${w.tag})` : "";
-		parts.push(`${shortTag(w.label)} ${rounded}% left${reset}${tagStr}`);
+		const label = shortTag(w.label);
+		const value = `${rounded}%`;
+		const styledLabel = theme ? theme.fg("dim", `${label} `) : `${label} `;
+		const styledValue = theme ? theme.fg(footerTone(remaining), value) : value;
+		const styledReset = theme && reset ? theme.fg("dim", reset) : reset;
+		const styledTag = theme && tagStr ? theme.fg("dim", tagStr) : tagStr;
+		parts.push(`${styledLabel}${compactMeter(remaining, theme)} ${styledValue}${styledReset}${styledTag}`);
 	}
-	return parts.length ? `Quota ${parts.join(" · ")}` : "Quota n/a";
+	return parts.length ? `Quota ${parts.join(theme ? theme.fg("dim", " · ") : " · ")}` : "Quota n/a";
 }
 
 // ---------- extension ----------
@@ -605,18 +710,29 @@ export default function (pi: ExtensionAPI): void {
 	const QUOTA_KEY = "cliproxy-quota";
 	let lastFooterFetch = 0;
 
-	async function collectUsage(now: number, prefer?: string | null): Promise<{ blocks: string[]; footer: string }> {
+	async function collectUsage(
+		now: number,
+		prefer?: string | null,
+		theme?: FooterTheme,
+		model?: { provider?: string; id?: string } | string | null,
+	): Promise<{ blocks: string[]; footer: string }> {
 		const base = resolveBaseUrl();
 		const key = resolveManagementKey();
 		if (!key) throw new Error("NO_KEY");
-		return collectQuota(base, key, now, prefer);
+		return collectQuota(base, key, now, prefer, theme, model);
 	}
 
 	// silent=true only refreshes the footer (used for auto-refresh during/after a turn).
 	async function runQuota(ctx: ExtensionContext, silent = false): Promise<void> {
 		if (!silent) ctx.ui.notify("Fetching quota…", "info");
 		try {
-			const { blocks, footer } = await collectUsage(Date.now(), providerFromModel(ctx.model));
+			const theme = isPrimaryUiSession(ctx) ? ctx.ui.theme : undefined;
+			const { blocks, footer } = await collectUsage(
+				Date.now(),
+				providerFromModel(ctx.model),
+				theme,
+				ctx.model,
+			);
 			if (!silent) ctx.ui.notify(`Subscription quota\n${blocks.join("\n")}`, "info");
 			if (footer && isPrimaryUiSession(ctx)) {
 				ctx.ui.setStatus(QUOTA_KEY, ctx.ui.theme.fg("dim", footer));
