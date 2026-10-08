@@ -9,6 +9,9 @@ import {
 	formatReset,
 	parseCodexUsage,
 	parseQuotaSummary,
+	parseKiroUsage,
+	kiroWindowLabel,
+	isKiroModel,
 	selectBestGroup,
 	providerFromModel,
 } from "./index.ts";
@@ -43,6 +46,102 @@ console.assert(
 );
 console.assert(summaryFromWins([{ label: "5h", remainingPct: 125, resetIso: "2026-08-19T14:00:00Z" }], now) === "Quota 5h ━━━━━━ 100%", "clamped footer quota");
 console.assert(providerFromModel({ provider: "openai", id: "gpt-5" }) === "codex", "provider model detection");
+console.assert(providerFromModel({ provider: "kiro", id: "auto" }) === "kiro", "provider kiro auto detection");
+console.assert(providerFromModel({ provider: "cliproxyapi", id: "kiro/claude-opus-5.5" }) === "kiro", "provider kiro model prefix detection");
+console.assert(providerFromModel({ provider: "kiro", id: "claude-sonnet-4-6" }) === "kiro", "kiro provider overrides claude text");
+console.assert(isKiroModel({ provider: "cliproxyapi", id: "claude-opus-5.5" }), "isKiroModel claude-opus-5.5");
+console.assert(isKiroModel("claude-opus-5.5"), "isKiroModel string id");
+console.assert(providerFromModel({ provider: "cliproxyapi", id: "claude-opus-5.5" }) === "kiro", "providerFromModel claude-opus-5.5 mapped to kiro");
+console.assert(providerFromModel({ provider: "cliproxyapi", id: "claude-sonnet-5.5" }) === "kiro", "providerFromModel claude-sonnet-5.5 mapped to kiro");
+console.assert(providerFromModel({ provider: "cliproxyapi", id: "gpt-5.6-terra" }) === "kiro", "providerFromModel gpt-5.6-terra mapped to kiro");
+console.assert(providerFromModel({ provider: "cliproxyapi", id: "claude-sonnet-4.6" }, ["kiro"]) === "kiro", "providerFromModel claude fallback to kiro when only kiro available");
+
+// kiroWindowLabel unit checks
+console.assert(kiroWindowLabel("Credits", "Plan") === "monthly credits", "kiro default plan label");
+console.assert(kiroWindowLabel("Credits", "Free trial") === "credits · free trial", "kiro free trial label");
+console.assert(kiroWindowLabel("Account Pool", "Monthly") === "Account Pool · Monthly", "kiro custom group label");
+
+// parseKiroUsage unit checks:
+// 1. Live observed shape: subscription, summary used_0/limit_0, groups with Credits/Plan
+const kiroLive = parseKiroUsage(JSON.stringify({
+	subscription: { plan: "KIRO PRO+", tierId: "Q_DEVELOPER_STANDALONE_PRO_PLUS" },
+	summary: [
+		{ key: "used_0", label: "Credits used", value: 27.1, unit: "invocations", format: "number" },
+		{ key: "limit_0", label: "Credits limit", value: 2000, unit: "invocations", format: "number" },
+	],
+	groups: [
+		{
+			displayName: "Credits",
+			buckets: [
+				{ window: "Plan", remainingFraction: 0.98645, resetTime: "2026-11-01T00:00:00Z", description: "27.1 / 2000" },
+			],
+		},
+	],
+}));
+console.assert(kiroLive.length === 1, "kiro live length");
+console.assert(kiroLive[0].label === "monthly credits", "kiro live label");
+console.assert(Math.abs((kiroLive[0].remainingPct ?? 0) - 98.645) < 0.001, "kiro live remainingPct");
+console.assert(kiroLive[0].used === 27.1 && kiroLive[0].limit === 2000 && kiroLive[0].unit === "invocations", "kiro live metrics");
+console.assert(kiroLive[0].resetIso === "2026-11-01T00:00:00Z", "kiro live resetIso");
+
+// renderWindows with Kiro metrics: should display percentage, used/limit, remaining absolute, and reset countdown
+const renderedKiro = renderWindows(kiroLive, now)[0];
+console.assert(renderedKiro.includes("1% used · 99% left (27.1/2000 invocations · 1972.9 left)"), "kiro render detail formatting");
+console.assert(summaryFromWins(kiroLive, now).includes("Quota monthly ━━━━━━ 99%"), "kiro footer compact percentage");
+
+// 2. Exhausted quota (0% remaining fraction)
+const kiroExhausted = parseKiroUsage(JSON.stringify({
+	summary: [
+		{ key: "used_0", value: 50, unit: "invocations" },
+		{ key: "limit_0", value: 50, unit: "invocations" },
+	],
+	groups: [
+		{
+			displayName: "Credits",
+			buckets: [
+				{ window: "Plan", remainingFraction: 0, resetTime: "2026-09-01T00:00:00Z", description: "50 / 50" },
+			],
+		},
+	],
+}));
+console.assert(kiroExhausted.length === 1 && kiroExhausted[0].remainingPct === 0, "kiro exhausted remainingPct 0 preserved");
+console.assert(renderWindows(kiroExhausted, now)[0].includes("100% used · 0% left (50/50 invocations · 0 left)"), "kiro exhausted render");
+
+// 3. Fallback when summary array is missing but bucket description has "used / limit unit"
+const kiroFallback = parseKiroUsage(JSON.stringify({
+	groups: [
+		{
+			displayName: "Credits",
+			buckets: [
+				{ window: "Plan", description: "15 / 100 requests", resetTime: "2026-09-01T00:00:00Z" },
+			],
+		},
+	],
+}));
+console.assert(kiroFallback.length === 1, "kiro fallback parsed");
+console.assert(kiroFallback[0].used === 15 && kiroFallback[0].limit === 100 && kiroFallback[0].unit === "requests", "kiro description parsed");
+console.assert(kiroFallback[0].remainingPct === 85, "kiro fallback calculated remainingPct");
+
+// 4. Multiple buckets (Plan + Free trial)
+const kiroMulti = parseKiroUsage(JSON.stringify({
+	summary: [
+		{ key: "used_0", value: 10, unit: "credits" },
+		{ key: "limit_0", value: 100, unit: "credits" },
+		{ key: "used_1", value: 5, unit: "credits" },
+		{ key: "limit_1", value: 20, unit: "credits" },
+	],
+	groups: [
+		{
+			displayName: "Credits",
+			buckets: [
+				{ window: "Plan", remainingFraction: 0.9, resetTime: "2026-11-01T00:00:00Z" },
+				{ window: "Free trial", remainingFraction: 0.75, resetTime: "2026-09-01T00:00:00Z" },
+			],
+		},
+	],
+}));
+console.assert(kiroMulti.length === 2, "kiro multi length");
+console.assert(kiroMulti[0].label === "monthly credits" && kiroMulti[1].label === "credits · free trial", "kiro multi labels");
 
 // 100% remaining should NOT display a countdown (avoids sliding resetTime illusion like ↻4h59m)
 const fullWins = [
@@ -159,7 +258,10 @@ try {
 		const url = String(input);
 		if (url.endsWith("/auth-files")) {
 			return Response.json({
-				files: [{ id: "claude-1", name: "Claude", provider: "claude", auth_index: "claude-1", email: "user@example.com" }],
+				files: [
+					{ id: "claude-1", name: "Claude", provider: "claude", auth_index: "claude-1", email: "user@example.com" },
+					{ id: "kiro-1", name: "kiro-idc.json", provider: "kiro", auth_index: "kiro-1", label: "Kiro Account" },
+				],
 			});
 		}
 		if (url.endsWith("/api-call")) {
@@ -171,11 +273,35 @@ try {
 				}),
 			});
 		}
+		if (url.endsWith("/quota/fetch")) {
+			return Response.json({
+				subscription: { plan: "KIRO PRO+" },
+				summary: [
+					{ key: "used_0", value: 27.1, unit: "invocations" },
+					{ key: "limit_0", value: 2000, unit: "invocations" },
+				],
+				groups: [
+					{
+						displayName: "Credits",
+						buckets: [
+							{ window: "Plan", remainingFraction: 0.98645, resetTime: "2026-11-01T00:00:00Z" },
+						],
+					},
+				],
+			});
+		}
 		throw new Error(`Unexpected mocked request: ${url}`);
 	};
 	const mocked = await collectQuota("http://mock", "test-key", now, "codex");
 	console.assert(mocked.footer.startsWith("Quota[claude] 5h ━━━━── 64%"), "provider fallback footer");
 	console.assert(mocked.blocks[0] === "● user@example.com [claude]", "mocked credential rendering");
+	console.assert(mocked.blocks[3] === "● Kiro Account [kiro]", "mocked kiro credential rendering");
+	console.assert(mocked.blocks[4].includes("monthly credits"), "mocked kiro window rendering");
+	console.assert(mocked.blocks[4].includes("27.1/2000 invocations"), "mocked kiro detail rendering");
+
+	const mockedKiro = await collectQuota("http://mock", "test-key", now, "kiro");
+	console.assert(mockedKiro.footer.startsWith("Quota[kiro] monthly ━━━━━━ 99%"), "kiro model selection footer");
+
 	const themedMocked = await collectQuota("http://mock", "test-key", now, "codex", mockTheme);
 	console.assert(themedMocked.footer.startsWith("Quota[claude] <dim>5h </dim>"), "theme forwarded through quota collection");
 } finally {

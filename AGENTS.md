@@ -42,13 +42,14 @@ Add this directory's `index.ts` absolute path to the `extensions` array in
 
 - Provider registry in `index.ts` (`ADAPTERS`): one adapter per OAuth provider, each with its own
   endpoint / headers / body and a parser that normalizes to `Win { label, remainingPct, resetIso }`.
-- **Verified** against live accounts: `claude`, `antigravity` / `gemini`, `kimi`, `codex`.
+- **Verified** against live accounts: `claude`, `antigravity` / `gemini`, `kimi`, `codex`, `kiro`.
 - **Unverified** (endpoints + parsers ported from the EasyCLIProxyAPI panel, not yet tested on a real
   account, shown as `(unverified)` in output): `xai` / `grok`. To verify one: run its
   request through `POST /v0/management/api-call` with a real credential, compare the raw JSON to the
   adapter's field names, adjust, then flip `verified: true`.
 - The management `api-call` request body uses fields `{ authIndex, method, url, header, body }` where
-  `body` is a **string** (sending `data` or an object body returns `invalid body`).
+  `body` is a **string** (sending `data` or an object body returns `invalid body`). Kiro fetches
+  directly from CLIProxyAPI's plugin quota API `POST /v0/management/quota/fetch` with `{ auth_index }`.
 
 ## Release
 

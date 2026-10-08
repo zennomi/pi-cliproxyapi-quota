@@ -12,9 +12,11 @@ It surfaces subscription limits for reverse-proxied models inside pi:
 
 - **Quota** — see subscription limits for **every OAuth provider** the proxy holds without leaving pi.
 
-Supported providers: **Claude**, **Antigravity / Gemini Code Assist**, **Kimi**, and **Codex** (verified), plus
+Supported providers: **Claude**, **Antigravity / Gemini Code Assist**, **Kimi**, **Codex**, and **Kiro** (verified), plus
 **xAI / Grok** (best‑effort, shown as `(unverified)` until confirmed against a real
 account — see [Scope](#scope--limitations)).
+
+Kiro subscriptions expose monthly credits rather than 5h/weekly windows. `/quota` displays both percentage and absolute usage (`used / limit <unit> · <remaining> left`), and the footer displays a compact `monthly` meter. Kiro quota is fetched via CLIProxyAPI's native plugin quota API (`POST /v0/management/quota/fetch`).
 
 ## Features
 
@@ -64,7 +66,7 @@ If you don’t run the GUI, set `CLIPROXYAPI_MANAGEMENT_KEY` (must match your pr
 
 ## Scope & limitations
 
-- **Verified** (tested against live accounts): `claude`, `antigravity` / `gemini`, `kimi`, `codex`.
+- **Verified** (tested against live accounts): `claude`, `antigravity` / `gemini`, `kimi`, `codex`, `kiro`.
 - **Unverified** (ported from the EasyCLIProxyAPI panel, endpoints + parsers wired but not yet tested
   against a real account): `xai` / `grok`. These are labelled `(unverified)` in the
   output. If one is wrong for your account, please open an issue with the raw response — easy to fix.
@@ -84,8 +86,10 @@ MIT
 
 - **额度** — 在 pi 里直接看代理持有的**每个 OAuth 提供方**的订阅限额。
 
-支持的提供方：**Claude**、**Antigravity / Gemini Code Assist**、**Kimi**、**Codex**（已验证），以及
+支持的提供方：**Claude**、**Antigravity / Gemini Code Assist**、**Kimi**、**Codex**、**Kiro**（已验证），以及
 **xAI / Grok**（尽力支持，在真实账号上校准前显示为 `(unverified)`）。
+
+Kiro 订阅使用按月额度（不分 5h/7d 窗口）。`/quota` 显示百分比及具体用量（`已用 / 总额 <单位> · 剩余`），footer 显示紧凑的 `monthly` 额度条。Kiro 额度通过 CLIProxyAPI 原生插件配额接口（`POST /v0/management/quota/fetch`）获取。
 
 ### 功能
 
@@ -133,7 +137,7 @@ pi install git:github.com/songhuiming2007-coder/pi-cliproxyapi-quota
 
 ### 范围与限制
 
-- **已验证**（在真实账号上实测）：`claude`、`antigravity` / `gemini`、`kimi`、`codex`。
+- **已验证**（在真实账号上实测）：`claude`、`antigravity` / `gemini`、`kimi`、`codex`、`kiro`。
 - **未验证**（按 EasyCLIProxyAPI 面板移植，端点与解析已接但未在真实账号上跑过）：`xai` / `grok`，输出里标 `(unverified)`。若某家在你账号上不对，请带原始返回开 issue，很容易修。
 - 仅读取本地管理密钥去调本机管理 API；除了你自己的代理和（经代理的）各提供方用量端点，不向任何地方发送数据；禁用的凭证会跳过。
 

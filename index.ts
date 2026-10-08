@@ -5,7 +5,7 @@
  *  - /quota: show subscription quota for every OAuth provider the proxy holds,
  *    fetched exactly like the EasyCLIProxyAPI panel does via the proxy management
  *    API `POST /v0/management/api-call`. Providers: claude + antigravity/gemini
- *    + kimi + codex (verified), xai (best-effort, marked (unverified)).
+ *    + kimi + codex + kiro (verified), xai (best-effort, marked (unverified)).
  *  - Footer quota display: automatically refreshed at turn start/end.
  *
  * No secrets in source. Management key is read at runtime from env,
@@ -103,6 +103,17 @@ async function mgmtGet<T>(base: string, key: string, path: string): Promise<T> {
 	return (await res.json()) as T;
 }
 
+async function mgmtPost<T>(base: string, key: string, path: string, body: unknown): Promise<T> {
+	const res = await fetch(`${base}/v0/management/${path}`, {
+		method: "POST",
+		headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(20_000),
+	});
+	if (!res.ok) throw new Error(`POST ${path} -> HTTP ${res.status}`);
+	return (await res.json()) as T;
+}
+
 async function mgmtApiCall(
 	base: string,
 	key: string,
@@ -130,6 +141,7 @@ async function listCredentials(base: string, key: string): Promise<AuthFile[]> {
 function providerKey(f: AuthFile): string {
 	const raw = (f.provider ?? f.type ?? "").trim().toLowerCase().replace(/_/g, "-");
 	if (raw === "x-ai" || raw === "grok") return "xai";
+	if (raw === "kiro-ha") return "kiro";
 	return raw;
 }
 
@@ -140,6 +152,9 @@ export interface Win {
 	resetIso: string | null;
 	tag?: string;
 	group?: string;
+	used?: number | null;
+	limit?: number | null;
+	unit?: string;
 }
 
 function toNum(v: unknown): number | null {
@@ -451,6 +466,87 @@ const xaiAdapter: Adapter = {
 	},
 };
 
+// ---- kiro (VERIFIED): POST /v0/management/quota/fetch ----
+export function kiroWindowLabel(groupName: string, windowName: string): string {
+	const g = groupName.trim().toLowerCase();
+	const w = windowName.trim().toLowerCase();
+	if ((g === "credits" || g === "credit" || !g) && (w === "plan" || w === "monthly" || !w)) {
+		return "monthly credits";
+	}
+	if (g === "credits" || g === "credit") {
+		return w ? `credits · ${w}` : "monthly credits";
+	}
+	return w ? `${groupName} · ${windowName}` : groupName || "monthly credits";
+}
+
+export function parseKiroUsage(body: string | Record<string, unknown>): Win[] {
+	const data = (typeof body === "string" ? JSON.parse(body) : body) as {
+		summary?: Array<{ key?: unknown; label?: unknown; value?: unknown; unit?: unknown }>;
+		groups?: Array<{ displayName?: unknown; display_name?: unknown; buckets?: Array<Record<string, unknown>> }>;
+		error?: unknown;
+	};
+	if (typeof data.error === "string" && data.error) {
+		throw new Error(data.error);
+	}
+	const summary = data.summary ?? [];
+	const wins: Win[] = [];
+	let bucketIndex = 0;
+
+	for (const g of data.groups ?? []) {
+		const gname = String(g.displayName ?? g.display_name ?? "").trim() || "Credits";
+		for (const b of g.buckets ?? []) {
+			const frac = toNum(b.remainingFraction ?? b.remaining_fraction);
+			let used = toNum(summary.find((s) => s.key === `used_${bucketIndex}`)?.value);
+			let limit = toNum(summary.find((s) => s.key === `limit_${bucketIndex}`)?.value);
+			let unit = String(
+				summary.find((s) => s.key === `used_${bucketIndex}` || s.key === `limit_${bucketIndex}`)?.unit ?? "",
+			).trim();
+
+			if ((used === null || limit === null) && typeof b.description === "string") {
+				const m = b.description.match(/^\s*([\d.]+)\s*\/\s*([\d.]+)(?:\s+(.+))?\s*$/);
+				if (m) {
+					if (used === null) used = toNum(m[1]);
+					if (limit === null) limit = toNum(m[2]);
+					if (!unit && m[3]) unit = m[3].trim();
+				}
+			}
+
+			let remainingPct: number | null = null;
+			if (frac !== null) {
+				remainingPct = Math.max(0, Math.min(100, frac * 100));
+			} else if (used !== null && limit !== null && limit > 0) {
+				remainingPct = Math.max(0, Math.min(100, ((limit - used) / limit) * 100));
+			}
+
+			if (remainingPct !== null) {
+				const windowName = String(b.window ?? "").trim();
+				wins.push({
+					label: kiroWindowLabel(gname, windowName),
+					remainingPct,
+					resetIso: firstIso(b.resetTime, b.reset_time, b.reset),
+					group: gname,
+					...(used !== null ? { used } : {}),
+					...(limit !== null ? { limit } : {}),
+					...(unit ? { unit } : {}),
+				});
+			}
+			bucketIndex++;
+		}
+	}
+	return wins;
+}
+
+const kiroAdapter: Adapter = {
+	verified: true,
+	async fetch(base, key, cred) {
+		const authIndex = cred.auth_index as string;
+		const res = await mgmtPost<Record<string, unknown>>(base, key, "quota/fetch", {
+			auth_index: authIndex,
+		});
+		return parseKiroUsage(res);
+	},
+};
+
 const ADAPTERS: Record<string, Adapter> = {
 	claude: claudeAdapter,
 	antigravity: antigravityAdapter,
@@ -458,12 +554,65 @@ const ADAPTERS: Record<string, Adapter> = {
 	kimi: kimiAdapter,
 	codex: codexAdapter,
 	xai: xaiAdapter,
+	kiro: kiroAdapter,
 };
 
+function loadCachedKiroModelIds(): Set<string> {
+	const ids = new Set<string>();
+	const data = readJson(join(AGENT_DIR, "kiro-management-models-cache.json")) as {
+		regions?: Record<string, { models?: Array<{ id?: string; kiroModelId?: string }> }>;
+	} | undefined;
+	for (const reg of Object.values(data?.regions ?? {})) {
+		for (const m of reg.models ?? []) {
+			if (m.id) ids.add(m.id.toLowerCase());
+			if (m.kiroModelId) ids.add(m.kiroModelId.toLowerCase());
+		}
+	}
+	return ids;
+}
+
+const KIRO_MODEL_PATTERNS = [
+	"opus-5",
+	"sonnet-5",
+	"opus-4",
+	"haiku-4.5",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+	"qwen3-coder-next",
+];
+
+export function isKiroModel(model: { provider?: string; id?: string } | string | null | undefined): boolean {
+	if (!model) return false;
+	const modelObj = typeof model === "string" ? { id: model } : model;
+	const s = `${modelObj.provider ?? ""} ${modelObj.id ?? ""}`.toLowerCase();
+	if (s.includes("kiro")) return true;
+	const mid = (modelObj.id ?? "").toLowerCase();
+	if (KIRO_MODEL_PATTERNS.some((p) => mid.includes(p))) return true;
+	const cached = loadCachedKiroModelIds();
+	if (cached.has(mid) || cached.has(mid.replace(/^cliproxyapi\//, ""))) {
+		if (!mid.includes("gpt-") || mid.includes("terra") || mid.includes("luna")) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /** Guess which quota provider the current pi model routes to (by provider/id text). */
-export function providerFromModel(model: { provider?: string; id?: string } | undefined): string | null {
-	const s = `${model?.provider ?? ""} ${model?.id ?? ""}`.toLowerCase();
-	if (s.includes("claude")) return "claude";
+export function providerFromModel(
+	model: { provider?: string; id?: string } | string | null | undefined,
+	available?: Iterable<string>,
+): string | null {
+	if (!model) return null;
+	const modelObj = typeof model === "string" ? { id: model } : model;
+	if (isKiroModel(modelObj)) return "kiro";
+	const s = `${modelObj.provider ?? ""} ${modelObj.id ?? ""}`.toLowerCase();
+	if (s.includes("claude")) {
+		if (available) {
+			const set = new Set(available);
+			if (!set.has("claude") && set.has("kiro")) return "kiro";
+		}
+		return "claude";
+	}
 	if (s.includes("gemini") || s.includes("antigravity")) return "antigravity";
 	if (s.includes("codex") || s.includes("gpt")) return "codex";
 	if (s.includes("kimi")) return "kimi";
@@ -503,9 +652,17 @@ export async function collectQuota(
 		}
 	}
 	// Footer follows the current model's provider; fall back to the first available.
-	// Tag the provider whenever it is not the current model's (or when several exist),
-	// so a fallback never masquerades as the active provider's quota.
-	const actual = prefer && summaries.has(prefer) ? prefer : [...summaries.keys()][0];
+	// If prefer was not passed or resolved to a provider not in summaries,
+	// refine using the actual available providers.
+	const available = new Set(summaries.keys());
+	let resolvedPrefer = prefer && available.has(prefer) ? prefer : null;
+	if (!resolvedPrefer && model) {
+		const refined = providerFromModel(model, available);
+		if (refined && available.has(refined)) {
+			resolvedPrefer = refined;
+		}
+	}
+	const actual = resolvedPrefer ?? [...summaries.keys()][0];
 	const hit = actual !== undefined ? summaries.get(actual) : undefined;
 	const footer =
 		hit && actual
@@ -539,6 +696,11 @@ function bar(pct: number, width = 12): string {
 	return "█".repeat(filled) + "░".repeat(width - filled);
 }
 
+function formatAmount(val: number): string {
+	if (Math.abs(val - Math.round(val)) < 0.000001) return String(Math.round(val));
+	return String(Number(val.toFixed(2)));
+}
+
 /** Build display lines for one credential's normalized windows. */
 export function renderWindows(wins: Win[], now = Date.now()): string[] {
 	if (wins.length === 0) return ["  (no quota window data)"];
@@ -550,7 +712,11 @@ export function renderWindows(wins: Win[], now = Date.now()): string[] {
 		// suppress when the displayed value rounds to 100%: upstream slides resetTime
 		// on untouched buckets (always now+window), so a countdown there is an illusion.
 		const resetStr = Math.round(remain) >= 100 ? "—" : formatReset(w.resetIso, now);
-		return `  ${w.label.padEnd(22)} ${bar(used)} ${used.toFixed(0)}% used · ${remain.toFixed(0)}% left · ${resetStr}${tagStr}`;
+		const detailStr =
+			w.used !== undefined && w.used !== null && w.limit !== undefined && w.limit !== null
+				? ` (${formatAmount(w.used)}/${formatAmount(w.limit)}${w.unit ? ` ${w.unit}` : ""} · ${formatAmount(Math.max(0, w.limit - w.used))} left)`
+				: "";
+		return `  ${w.label.padEnd(22)} ${bar(used)} ${used.toFixed(0)}% used · ${remain.toFixed(0)}% left${detailStr} · ${resetStr}${tagStr}`;
 	});
 }
 
@@ -747,7 +913,7 @@ export default function (pi: ExtensionAPI): void {
 				);
 			} else if (msg === "NO_CRED") {
 				ctx.ui.notify(
-					"No usable OAuth credential found (claude / codex / antigravity / gemini / kimi / xai).",
+					"No usable OAuth credential found (claude / codex / antigravity / gemini / kimi / xai / kiro).",
 					"warning",
 				);
 			} else {
