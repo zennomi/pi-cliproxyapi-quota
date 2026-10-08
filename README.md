@@ -24,7 +24,7 @@ Kiro subscriptions expose monthly credits rather than 5h/weekly windows. `/quota
 |---|---|
 | `/quota` | For each credential the proxy holds, show every quota window: used %, remaining %, reset countdown. |
 | `Ctrl+Shift+Q` | Same as `/quota`, but works **while the model is streaming** (it's a shortcut, not a queued command). |
-| footer `Quota[claude] 5h ━━━━── 64% · 7d ━━━━━━ 95%` | Compact 6-cell **remaining** quota meters for the provider of the **current model** (follows model switches; falls back to the first credential). Filled meters and percentages are green when healthy, yellow at ≤30% left, and red at ≤10%; empty cells, separators, and reset times are dim. Auto-refreshed at the start/end of each turn (throttled to 60s). |
+| footer `Quota[claude] 5h ━━━━── 64% · 7d ━━━━━━ 95%` | Compact 6-cell **remaining** quota meters for the provider of the **current model** (follows model switches; falls back to the first credential). Filled meters and percentages are green when healthy, yellow at ≤30% left, and red at ≤10%; empty cells, separators, and reset times are dim. Refreshed on session load and model switches, then every 5 minutes, even while idle. |
 
 The quota data path mirrors the EasyCLIProxyAPI control panel exactly: the proxy management API
 `POST /v0/management/api-call` proxies each provider's own usage endpoint (e.g. Anthropic
@@ -97,7 +97,7 @@ Kiro 订阅使用按月额度（不分 5h/7d 窗口）。`/quota` 显示百分�
 |---|---|
 | `/quota` | 对代理持有的每个凭证，显示其所有配额窗口：已用 %、剩余 %、重置倒计时。 |
 | `Ctrl+Shift+Q` | 同 `/quota`，但**模型正在输出时也能按**（快捷键，不会被排队）。 |
-| footer `Quota[claude] 5h ━━━━── 64% · 7d ━━━━━━ 95%` | 显示**当前模型**对应服务的 6 格紧凑**剩余额度**条（随模型切换，取不到时回退到第一个凭证）。填充条和百分比：剩余 >30% 为绿色、≤30% 为黄色、≤10% 为红色；空格、分隔符和重置时间为暗色。每轮开始/结束自动刷新（60s 节流）。 |
+| footer `Quota[claude] 5h ━━━━── 64% · 7d ━━━━━━ 95%` | 显示**当前模型**对应服务的 6 格紧凑**剩余额度**条（随模型切换，取不到时回退到第一个凭证）。填充条和百分比：剩余 >30% 为绿色、≤30% 为黄色、≤10% 为红色；空格、分隔符和重置时间为暗色。会话加载及模型切换时刷新，此后每 5 分钟自动刷新（空闲时也会刷新）。 |
 
 取数链路与 EasyCLIProxyAPI 控制面板完全一致：代理管理 API `POST /v0/management/api-call`
 用存储的 OAuth 凭证代理请求各提供方自己的用量端点（如 Anthropic `/api/oauth/usage`、

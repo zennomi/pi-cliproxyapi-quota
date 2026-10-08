@@ -6,7 +6,7 @@
  *    fetched exactly like the EasyCLIProxyAPI panel does via the proxy management
  *    API `POST /v0/management/api-call`. Providers: claude + antigravity/gemini
  *    + kimi + codex + kiro (verified), xai (best-effort, marked (unverified)).
- *  - Footer quota display: automatically refreshed at turn start/end.
+ *  - Footer quota display: automatically refreshed every 5 minutes, even while idle.
  *
  * No secrets in source. Management key is read at runtime from env,
  * ~/.pi/agent/cliproxyapi-quota.json, or the GUI config.toml. See AGENTS.md.
@@ -868,13 +868,14 @@ function isPrimaryUiSession(ctx: ExtensionContext): boolean {
 export default function (pi: ExtensionAPI): void {
 	// Switching models switches the footer to that provider's quota immediately.
 	pi.on("model_select", (_e, ctx) => {
-		lastFooterFetch = 0;
-		refreshFooterThrottled(ctx);
+		if (footerTimer !== undefined) startFooterRefresh(ctx);
 	});
 
 	// ----- /quota -----
 	const QUOTA_KEY = "cliproxy-quota";
-	let lastFooterFetch = 0;
+	const FOOTER_REFRESH_MS = 5 * 60_000;
+	let footerTimer: ReturnType<typeof setInterval> | undefined;
+	let footerRevision = 0;
 
 	async function collectUsage(
 		now: number,
@@ -888,8 +889,9 @@ export default function (pi: ExtensionAPI): void {
 		return collectQuota(base, key, now, prefer, theme, model);
 	}
 
-	// silent=true only refreshes the footer (used for auto-refresh during/after a turn).
+	// silent=true only refreshes the footer (used for periodic auto-refresh).
 	async function runQuota(ctx: ExtensionContext, silent = false): Promise<void> {
+		const revision = ++footerRevision;
 		if (!silent) ctx.ui.notify("Fetching quota…", "info");
 		try {
 			const theme = isPrimaryUiSession(ctx) ? ctx.ui.theme : undefined;
@@ -900,7 +902,7 @@ export default function (pi: ExtensionAPI): void {
 				ctx.model,
 			);
 			if (!silent) ctx.ui.notify(`Subscription quota\n${blocks.join("\n")}`, "info");
-			if (footer && isPrimaryUiSession(ctx)) {
+			if (footer && isPrimaryUiSession(ctx) && revision === footerRevision) {
 				ctx.ui.setStatus(QUOTA_KEY, ctx.ui.theme.fg("dim", footer));
 			}
 		} catch (err) {
@@ -922,19 +924,23 @@ export default function (pi: ExtensionAPI): void {
 		}
 	}
 
-	// Auto-refresh footer on session load, first turn start, and each turn end.
-	// `before_agent_start` does not fire until after the first prompt, so it cannot
-	// populate the footer when pi first opens.
-	function refreshFooterThrottled(ctx: ExtensionContext): void {
-		if (!isPrimaryUiSession(ctx)) return;
-		const now = Date.now();
-		if (now - lastFooterFetch < 60_000) return;
-		lastFooterFetch = now;
-		void runQuota(ctx, true);
+	function stopFooterRefresh(): void {
+		if (footerTimer !== undefined) clearInterval(footerTimer);
+		footerTimer = undefined;
+		// Ignore any response still in flight from the old session/model.
+		footerRevision++;
 	}
-	pi.on("session_start", (_e, ctx) => refreshFooterThrottled(ctx));
-	pi.on("before_agent_start", (_e, ctx) => refreshFooterThrottled(ctx));
-	pi.on("agent_settled", (_e, ctx) => refreshFooterThrottled(ctx));
+
+	// Populate on session load, then refresh every 5 minutes without turn events.
+	function startFooterRefresh(ctx: ExtensionContext): void {
+		stopFooterRefresh();
+		if (!isPrimaryUiSession(ctx)) return;
+		void runQuota(ctx, true);
+		footerTimer = setInterval(() => void runQuota(ctx, true), FOOTER_REFRESH_MS);
+		footerTimer.unref();
+	}
+	pi.on("session_start", (_e, ctx) => startFooterRefresh(ctx));
+	pi.on("session_shutdown", () => stopFooterRefresh());
 
 	// Works while streaming: shortcut fetches and shows quota immediately.
 	pi.registerShortcut("ctrl+shift+q", {
