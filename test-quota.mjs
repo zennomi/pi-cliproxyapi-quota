@@ -1,5 +1,8 @@
 // Live smoke test of the quota data path + pure renderers.
-// Run: node test-quota.mjs
+// Run: node test-quota.mjs (or --offline for unit checks only)
+import assert from "node:assert/strict";
+// Make the legacy smoke checks fail the process instead of only printing a warning.
+console.assert = (condition, message) => assert.ok(condition, message);
 import {
 	resolveBaseUrl,
 	resolveManagementKey,
@@ -11,9 +14,11 @@ import {
 	parseQuotaSummary,
 	parseKiroUsage,
 	kiroWindowLabel,
-	isKiroModel,
 	selectBestGroup,
-	providerFromModel,
+	resolveModelAuth,
+	authIndexFromHeaders,
+	isProxyModel,
+	quotaFooter,
 } from "./index.ts";
 
 // formatReset unit checks
@@ -45,16 +50,55 @@ console.assert(
 	"footer only shows two windows",
 );
 console.assert(summaryFromWins([{ label: "5h", remainingPct: 125, resetIso: "2026-08-19T14:00:00Z" }], now) === "Quota 5h ━━━━━━ 100%", "clamped footer quota");
-console.assert(providerFromModel({ provider: "openai", id: "gpt-5" }) === "codex", "provider model detection");
-console.assert(providerFromModel({ provider: "kiro", id: "auto" }) === "kiro", "provider kiro auto detection");
-console.assert(providerFromModel({ provider: "cliproxyapi", id: "kiro/claude-opus-5.5" }) === "kiro", "provider kiro model prefix detection");
-console.assert(providerFromModel({ provider: "kiro", id: "claude-sonnet-4-6" }) === "kiro", "kiro provider overrides claude text");
-console.assert(isKiroModel({ provider: "cliproxyapi", id: "claude-opus-5.5" }), "isKiroModel claude-opus-5.5");
-console.assert(isKiroModel("claude-opus-5.5"), "isKiroModel string id");
-console.assert(providerFromModel({ provider: "cliproxyapi", id: "claude-opus-5.5" }) === "kiro", "providerFromModel claude-opus-5.5 mapped to kiro");
-console.assert(providerFromModel({ provider: "cliproxyapi", id: "claude-sonnet-5.5" }) === "kiro", "providerFromModel claude-sonnet-5.5 mapped to kiro");
-console.assert(providerFromModel({ provider: "cliproxyapi", id: "gpt-5.6-terra" }) === "kiro", "providerFromModel gpt-5.6-terra mapped to kiro");
-console.assert(providerFromModel({ provider: "cliproxyapi", id: "claude-sonnet-4.6" }, ["kiro"]) === "kiro", "providerFromModel claude fallback to kiro when only kiro available");
+// Routing comes from credentials' registered IDs, never model family/provider-name guesses.
+const routes = [
+	{ credential: { id: "c1", name: "c1.json", provider: "claude", auth_index: "1111111111111111" }, modelIds: ["claude-opus-5.5", "claude-sonnet-4-6", "friendly-alias"] },
+	{ credential: { id: "a1", name: "a1.json", provider: "antigravity", auth_index: "2222222222222222" }, modelIds: ["claude-sonnet-4-6", "gpt-oss-120b"] },
+	{ credential: { id: "o1", name: "o1.json", provider: "codex", auth_index: "3333333333333333" }, modelIds: ["gpt-5.6-terra"] },
+	{ credential: { id: "k1", name: "k1.json", provider: "kiro", auth_index: "4444444444444444" }, modelIds: ["kiro/auto", "qwen3-coder-next"] },
+];
+assert.equal(resolveModelAuth("claude-opus-5.5", routes).credential.provider, "claude");
+assert.equal(resolveModelAuth("gpt-5.6-terra", routes).credential.provider, "codex");
+assert.equal(resolveModelAuth("gpt-oss-120b", routes).credential.provider, "antigravity");
+assert.equal(resolveModelAuth("friendly-alias", routes).credential.provider, "claude");
+assert.equal(resolveModelAuth("kiro/auto", routes).credential.provider, "kiro");
+assert.equal(resolveModelAuth("auto", routes).kind, "unknown", "do not strip provider prefixes");
+assert.equal(resolveModelAuth("friendly-alias(high)", routes).credential.provider, "claude");
+assert.equal(resolveModelAuth({ provider: "kiro", id: "claude-opus-5.5" }, routes).credential.provider, "claude");
+assert.deepEqual(resolveModelAuth("claude-sonnet-4-6", routes), { kind: "ambiguous", providers: ["claude", "antigravity"], count: 2 });
+assert.equal(resolveModelAuth("claude-sonnet-4-6", routes, "2222222222222222").credential.provider, "antigravity");
+assert.equal(resolveModelAuth("new-or-auto-model", routes, "2222222222222222").source, "trace");
+assert.deepEqual(resolveModelAuth("friendly-alias", routes, "deleted-auth"), { kind: "unknown", reason: "auth" });
+assert.equal(resolveModelAuth("unknown-model", routes).kind, "unknown");
+assert.deepEqual(resolveModelAuth("friendly-alias", [...routes, { credential: { auth_index: "unavailable" }, modelIds: null }]), { kind: "unknown", reason: "registry" });
+const disabledRoute = { credential: { ...routes[0].credential, disabled: true }, modelIds: null };
+assert.equal(resolveModelAuth("gpt-5.6-terra", [routes[2], disabledRoute]).credential.provider, "codex");
+assert.equal(resolveModelAuth("friendly-alias", [disabledRoute], "1111111111111111").kind, "unknown");
+const sameProvider = [...routes, { credential: { ...routes[0].credential, auth_index: "5555555555555555", name: "second.json" }, modelIds: ["friendly-alias"] }];
+assert.deepEqual(resolveModelAuth("friendly-alias", sameProvider), { kind: "ambiguous", providers: ["claude"], count: 2 });
+const snapshot = { base: "http://proxy", routes: sameProvider, windows: new Map([
+	["1111111111111111", wins], ["5555555555555555", [{ label: "5h", remainingPct: 12, resetIso: null }]],
+]) };
+assert.equal(quotaFooter(snapshot, "friendly-alias", null, now), "Quota[claude] auth pending (2 accounts)");
+assert.ok(quotaFooter(snapshot, "friendly-alias", "5555555555555555", now).startsWith("Quota[claude:55555555] 5h ━───── 12%"));
+assert.equal(quotaFooter(snapshot, "gpt-5.6-terra", null, now), "Quota[codex] n/a", "never fall back when selected quota is missing");
+assert.equal(quotaFooter(snapshot, "friendly-alias", "deleted-auth", now), "Quota auth unknown");
+
+const trace = "20261008235959-2222222222222222-0199b012-3456-7890-abcd-0123456789ab";
+assert.equal(authIndexFromHeaders({ "X-CPA-TRACE-ID": trace }), "2222222222222222");
+assert.equal(authIndexFromHeaders({ "x-cpa-trace-id": trace }), "2222222222222222");
+assert.equal(authIndexFromHeaders({}), null);
+for (const invalid of ["garbage", "20261008235959-2222222222222222-", "2222222222222222", "20261008235959-not-an-index-request"]) {
+	assert.equal(authIndexFromHeaders({ "x-cpa-trace-id": invalid }), null);
+}
+assert.ok(isProxyModel({ baseUrl: "http://localhost:8317/v1" }, "http://127.0.0.1:8317"));
+assert.ok(isProxyModel({ baseUrl: "http://[::1]:8317/v1beta" }, "http://127.0.0.1:8317"));
+assert.ok(isProxyModel({ baseUrl: "https://proxy.example/cpa/v1" }, "https://proxy.example/cpa/"));
+assert.ok(!isProxyModel({ baseUrl: "https://api.anthropic.com" }, "http://127.0.0.1:8317"));
+assert.ok(!isProxyModel({ baseUrl: "http://localhost:8318/v1" }, "http://127.0.0.1:8317"));
+assert.ok(!isProxyModel({ baseUrl: "https://proxy.example/cpa-other/v1" }, "https://proxy.example/cpa"));
+assert.ok(!isProxyModel({ baseUrl: "invalid" }, "http://127.0.0.1:8317"));
+assert.ok(!isProxyModel({ id: "claude-sonnet" }, "http://127.0.0.1:8317"));
 
 // kiroWindowLabel unit checks
 console.assert(kiroWindowLabel("Credits", "Plan") === "monthly credits", "kiro default plan label");
@@ -264,6 +308,10 @@ try {
 				],
 			});
 		}
+		if (url.includes("/auth-files/models?name=")) {
+			const name = new URL(url).searchParams.get("name");
+			return Response.json({ models: [{ id: name === "Claude" ? "friendly-alias" : "kiro/auto" }] });
+		}
 		if (url.endsWith("/api-call")) {
 			return Response.json({
 				status_code: 200,
@@ -292,17 +340,18 @@ try {
 		}
 		throw new Error(`Unexpected mocked request: ${url}`);
 	};
-	const mocked = await collectQuota("http://mock", "test-key", now, "codex");
-	console.assert(mocked.footer.startsWith("Quota[claude] 5h ━━━━── 64%"), "provider fallback footer");
+	const mocked = await collectQuota("http://mock", "test-key", now, null, undefined, "friendly-alias");
+	console.assert(mocked.footer.startsWith("Quota[claude] 5h ━━━━── 64%"), "registry-selected footer");
+	assert.equal((await collectQuota("http://mock", "test-key", now, null, undefined, "unknown")).footer, "Quota auth unknown");
 	console.assert(mocked.blocks[0] === "● user@example.com [claude]", "mocked credential rendering");
 	console.assert(mocked.blocks[3] === "● Kiro Account [kiro]", "mocked kiro credential rendering");
 	console.assert(mocked.blocks[4].includes("monthly credits"), "mocked kiro window rendering");
 	console.assert(mocked.blocks[4].includes("27.1/2000 invocations"), "mocked kiro detail rendering");
 
-	const mockedKiro = await collectQuota("http://mock", "test-key", now, "kiro");
+	const mockedKiro = await collectQuota("http://mock", "test-key", now, null, undefined, "kiro/auto");
 	console.assert(mockedKiro.footer.startsWith("Quota[kiro] monthly ━━━━━━ 99%"), "kiro model selection footer");
 
-	const themedMocked = await collectQuota("http://mock", "test-key", now, "codex", mockTheme);
+	const themedMocked = await collectQuota("http://mock", "test-key", now, "claude-1", mockTheme);
 	console.assert(themedMocked.footer.startsWith("Quota[claude] <dim>5h </dim>"), "theme forwarded through quota collection");
 } finally {
 	globalThis.fetch = originalFetch;
@@ -317,10 +366,16 @@ if (process.argv.includes("--offline")) {
 const base = resolveBaseUrl();
 const key = resolveManagementKey();
 console.log("baseUrl:", base);
-console.log("managementKey:", key ? key.slice(0, 6) + "…(" + key.length + " chars)" : "NONE");
+console.log("managementKey:", key ? "configured" : "NONE");
 if (!key) process.exit(1);
 
-const { blocks, footer } = await collectQuota(base, key);
+const model = process.argv.find((arg) => arg.startsWith("--model="))?.slice("--model=".length);
+const { blocks, footer, snapshot: liveSnapshot } = await collectQuota(base, key, Date.now(), null, undefined, model);
+assert.ok(liveSnapshot.routes.every((route) => route.modelIds !== null), "live model registry discovery failed");
 console.log("\n" + blocks.join("\n"));
 console.log("\nfooter:", footer);
+const discoveredIds = [...new Set(liveSnapshot.routes.flatMap((route) => route.modelIds ?? []))];
+for (const id of model ? [model] : discoveredIds.slice(0, 4)) {
+	console.log("routing:", id, "→", quotaFooter(liveSnapshot, id));
+}
 console.log("\nOK");

@@ -12,6 +12,7 @@
  * ~/.pi/agent/cliproxyapi-quota.json, or the GUI config.toml. See AGENTS.md.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -82,7 +83,7 @@ export function resolveManagementKey(): string | undefined {
 
 // ---------- management API ----------
 
-interface AuthFile {
+export interface AuthFile {
 	id: string;
 	name: string;
 	provider?: string;
@@ -94,47 +95,80 @@ interface AuthFile {
 	project_id?: string;
 }
 
-async function mgmtGet<T>(base: string, key: string, path: string): Promise<T> {
-	const res = await fetch(`${base}/v0/management/${path}`, {
-		headers: { Authorization: `Bearer ${key}` },
-		signal: AbortSignal.timeout(20_000),
-	});
-	if (!res.ok) throw new Error(`GET ${path} -> HTTP ${res.status}`);
-	return (await res.json()) as T;
+type ResponseHeaders = Record<string, string | string[]>;
+
+function retryAfterHeader(headers: Headers | ResponseHeaders | undefined): string | undefined {
+	if (headers instanceof Headers) return headers.get("retry-after") ?? undefined;
+	const value = Object.entries(headers ?? {}).find(([name]) => name.toLowerCase() === "retry-after")?.[1];
+	return Array.isArray(value) ? value[0] : value;
 }
 
-async function mgmtPost<T>(base: string, key: string, path: string, body: unknown): Promise<T> {
-	const res = await fetch(`${base}/v0/management/${path}`, {
-		method: "POST",
-		headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(20_000),
-	});
-	if (!res.ok) throw new Error(`POST ${path} -> HTTP ${res.status}`);
-	return (await res.json()) as T;
+export function retryAfterMs(value: string | undefined, now = Date.now()): number | undefined {
+	if (!value?.trim()) return undefined;
+	const text = value.trim();
+	if (/^\d+(?:\.\d+)?$/.test(text)) {
+		const ms = Number(text) * 1000;
+		return Number.isFinite(ms) ? Math.min(ms, Math.max(0, 8.64e15 - now)) : undefined;
+	}
+	const date = Date.parse(text);
+	return Number.isFinite(date) ? Math.max(0, date - now) : undefined;
 }
 
-async function mgmtApiCall(
-	base: string,
-	key: string,
-	body: unknown,
-): Promise<{ status_code: number; body: string }> {
-	const res = await fetch(`${base}/v0/management/api-call`, {
-		method: "POST",
-		headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(30_000),
+class QuotaHttpError extends Error {
+	readonly status: number;
+	readonly scope: "upstream" | "management";
+	readonly retryAfter?: string;
+	constructor(status: number, scope: "upstream" | "management", retryAfter?: string) {
+		super(`${scope} HTTP ${status}`);
+		this.status = status;
+		this.scope = scope;
+		this.retryAfter = retryAfter;
+	}
+}
+
+function requestSignal(signal: AbortSignal | undefined, timeout: number): AbortSignal {
+	signal?.throwIfAborted();
+	return signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout);
+}
+
+async function mgmtGet<T>(base: string, key: string, path: string, signal?: AbortSignal): Promise<T> {
+	const res = await fetch(`${base}/v0/management/${path}`, {
+		headers: { Authorization: `Bearer ${key}` }, signal: requestSignal(signal, 20_000),
 	});
-	if (!res.ok) throw new Error(`api-call -> HTTP ${res.status}`);
-	return (await res.json()) as { status_code: number; body: string };
+	signal?.throwIfAborted();
+	if (!res.ok) throw new QuotaHttpError(res.status, "management", retryAfterHeader(res.headers));
+	const data = await res.json();
+	signal?.throwIfAborted();
+	return data as T;
+}
+
+async function mgmtPost<T>(base: string, key: string, path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+	const res = await fetch(`${base}/v0/management/${path}`, {
+		method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+		body: JSON.stringify(body), signal: requestSignal(signal, 20_000),
+	});
+	signal?.throwIfAborted();
+	if (!res.ok) throw new QuotaHttpError(res.status, "management", retryAfterHeader(res.headers));
+	const data = await res.json();
+	signal?.throwIfAborted();
+	return data as T;
+}
+
+interface ApiCallResponse { status_code: number; body: string; header?: ResponseHeaders }
+
+async function mgmtApiCall(base: string, key: string, body: unknown, signal?: AbortSignal): Promise<ApiCallResponse> {
+	return mgmtPost<ApiCallResponse>(base, key, "api-call", body, signal);
 }
 
 // List every OAuth credential the proxy holds (any provider), enabled only.
-async function listCredentials(base: string, key: string): Promise<AuthFile[]> {
-	const data = await mgmtGet<{ files?: AuthFile[] }>(base, key, "auth-files");
-	return (data.files ?? []).filter(
-		(f) => typeof f.auth_index === "string" && f.auth_index.length > 0 && !f.disabled,
-	);
+async function listCredentials(base: string, key: string, signal?: AbortSignal): Promise<AuthFile[]> {
+	const data = await mgmtGet<{ files?: AuthFile[] }>(base, key, "auth-files", signal);
+	const seen = new Set<string>();
+	return (data.files ?? []).filter((f) => {
+		if (typeof f.auth_index !== "string" || !f.auth_index || f.disabled || seen.has(f.auth_index)) return false;
+		seen.add(f.auth_index);
+		return true;
+	});
 }
 
 // Normalize provider name the same way the GUI does.
@@ -173,10 +207,11 @@ async function proxyCall(
 	base: string,
 	key: string,
 	req: { authIndex: string; method: string; url: string; header?: Record<string, string>; body?: string },
+	signal?: AbortSignal,
 ): Promise<string> {
-	const out = await mgmtApiCall(base, key, req);
+	const out = await mgmtApiCall(base, key, req, signal);
 	if (out.status_code < 200 || out.status_code >= 300) {
-		throw new Error(`upstream HTTP ${out.status_code}`);
+		throw new QuotaHttpError(out.status_code, "upstream", retryAfterHeader(out.header));
 	}
 	return out.body;
 }
@@ -185,7 +220,7 @@ const BEARER = { Authorization: "Bearer $TOKEN$" };
 
 interface Adapter {
 	verified: boolean;
-	fetch: (base: string, key: string, cred: AuthFile) => Promise<Win[]>;
+	fetch: (base: string, key: string, cred: AuthFile, signal?: AbortSignal) => Promise<Win[]>;
 }
 
 // ---- claude (VERIFIED): GET api.anthropic.com/api/oauth/usage ----
@@ -200,14 +235,14 @@ const CLAUDE_WINDOWS: Array<[string, string]> = [
 ];
 const claudeAdapter: Adapter = {
 	verified: true,
-	async fetch(base, key, cred) {
+	async fetch(base, key, cred, signal) {
 		const authIndex = cred.auth_index as string;
 		const body = await proxyCall(base, key, {
 			authIndex,
 			method: "GET",
 			url: "https://api.anthropic.com/api/oauth/usage",
 			header: { ...BEARER, "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20" },
-		});
+		}, signal);
 		const usage = JSON.parse(body) as Record<string, { utilization?: unknown; resets_at?: unknown } | null>;
 		const wins: Win[] = [];
 		for (const [k, label] of CLAUDE_WINDOWS) {
@@ -258,7 +293,7 @@ export function parseQuotaSummary(body: string): Win[] {
 
 const antigravityAdapter: Adapter = {
 	verified: true,
-	async fetch(base, key, cred) {
+	async fetch(base, key, cred, signal) {
 		const authIndex = cred.auth_index as string;
 		const header = { ...BEARER, "Content-Type": "application/json", "User-Agent": ANTIGRAVITY_UA };
 		// project id comes from the auth-files listing; discover via loadCodeAssist if absent
@@ -269,11 +304,12 @@ const antigravityAdapter: Adapter = {
 					authIndex, method: "POST",
 					url: `${ANTIGRAVITY_HOSTS[0]}/v1internal:loadCodeAssist`,
 					header, body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
-				});
+				}, signal);
 				const d = JSON.parse(body) as { cloudaicompanionProject?: unknown };
 				const cp = d.cloudaicompanionProject;
 				project = typeof cp === "string" ? cp : (cp as { id?: string } | undefined)?.id;
-			} catch {
+			} catch (err) {
+				if (signal?.aborted || (err as QuotaHttpError).status === 429) throw err;
 				// fall through to the legacy metadata call below
 			}
 		}
@@ -285,9 +321,10 @@ const antigravityAdapter: Adapter = {
 						authIndex, method: "POST",
 						url: `${host}/v1internal:retrieveUserQuotaSummary`,
 						header, body: JSON.stringify({ project }),
-					});
+					}, signal);
 					return parseQuotaSummary(body);
 				} catch (err) {
+					if (signal?.aborted || (err as QuotaHttpError).status === 429) throw err;
 					lastErr = err;
 				}
 			}
@@ -300,7 +337,7 @@ const antigravityAdapter: Adapter = {
 			url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
 			header,
 			body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
-		});
+		}, signal);
 		return parseQuotaSummary(body);
 	},
 };
@@ -310,11 +347,11 @@ const antigravityAdapter: Adapter = {
 // with `limits[].window.{duration,timeUnit}` (e.g. 300 minutes = the 5h window).
 const kimiAdapter: Adapter = {
 	verified: true,
-	async fetch(base, key, cred) {
+	async fetch(base, key, cred, signal) {
 		const authIndex = cred.auth_index as string;
 		const body = await proxyCall(base, key, {
 			authIndex, method: "GET", url: "https://api.kimi.com/coding/v1/usages", header: { ...BEARER },
-		});
+		}, signal);
 		const data = JSON.parse(body) as {
 			usage?: Record<string, unknown>;
 			limits?: Array<{ window?: { duration?: unknown; timeUnit?: unknown }; detail?: Record<string, unknown> }>;
@@ -436,7 +473,7 @@ export function parseCodexUsage(body: string, now = Date.now()): Win[] {
 
 const codexAdapter: Adapter = {
 	verified: true,
-	async fetch(base, key, cred) {
+	async fetch(base, key, cred, signal) {
 		const authIndex = cred.auth_index as string;
 		const body = await proxyCall(base, key, {
 			authIndex,
@@ -447,7 +484,7 @@ const codexAdapter: Adapter = {
 				"Content-Type": "application/json",
 				"User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
 			},
-		});
+		}, signal);
 		return parseCodexUsage(body);
 	},
 };
@@ -455,11 +492,11 @@ const codexAdapter: Adapter = {
 // ---- xai / grok (UNVERIFIED): GET api.x.ai/v1/me (mostly account health) ----
 const xaiAdapter: Adapter = {
 	verified: false,
-	async fetch(base, key, cred) {
+	async fetch(base, key, cred, signal) {
 		const authIndex = cred.auth_index as string;
 		const body = await proxyCall(base, key, {
 			authIndex, method: "GET", url: "https://api.x.ai/v1/me", header: { ...BEARER, accept: "application/json" },
-		});
+		}, signal);
 		const data = JSON.parse(body) as Record<string, unknown>;
 		const p = toNum(data.usagePercent ?? data.usage_percent ?? data.creditUsagePercent);
 		return p === null ? [] : [{ label: "usage", remainingPct: Math.max(0, 100 - p), resetIso: null }];
@@ -538,11 +575,11 @@ export function parseKiroUsage(body: string | Record<string, unknown>): Win[] {
 
 const kiroAdapter: Adapter = {
 	verified: true,
-	async fetch(base, key, cred) {
+	async fetch(base, key, cred, signal) {
 		const authIndex = cred.auth_index as string;
 		const res = await mgmtPost<Record<string, unknown>>(base, key, "quota/fetch", {
 			auth_index: authIndex,
-		});
+		}, signal);
 		return parseKiroUsage(res);
 	},
 };
@@ -557,120 +594,354 @@ const ADAPTERS: Record<string, Adapter> = {
 	kiro: kiroAdapter,
 };
 
-function loadCachedKiroModelIds(): Set<string> {
-	const ids = new Set<string>();
-	const data = readJson(join(AGENT_DIR, "kiro-management-models-cache.json")) as {
-		regions?: Record<string, { models?: Array<{ id?: string; kiroModelId?: string }> }>;
-	} | undefined;
-	for (const reg of Object.values(data?.regions ?? {})) {
-		for (const m of reg.models ?? []) {
-			if (m.id) ids.add(m.id.toLowerCase());
-			if (m.kiroModelId) ids.add(m.kiroModelId.toLowerCase());
-		}
-	}
-	return ids;
+export interface ProxyModel {
+	provider?: string;
+	id?: string;
+	baseUrl?: string;
 }
 
-const KIRO_MODEL_PATTERNS = [
-	"opus-5",
-	"sonnet-5",
-	"opus-4",
-	"haiku-4.5",
-	"gpt-5.6-terra",
-	"gpt-5.6-luna",
-	"qwen3-coder-next",
-];
+type ModelHint = ProxyModel | string | null | undefined;
 
-export function isKiroModel(model: { provider?: string; id?: string } | string | null | undefined): boolean {
-	if (!model) return false;
-	const modelObj = typeof model === "string" ? { id: model } : model;
-	const s = `${modelObj.provider ?? ""} ${modelObj.id ?? ""}`.toLowerCase();
-	if (s.includes("kiro")) return true;
-	const mid = (modelObj.id ?? "").toLowerCase();
-	if (KIRO_MODEL_PATTERNS.some((p) => mid.includes(p))) return true;
-	const cached = loadCachedKiroModelIds();
-	if (cached.has(mid) || cached.has(mid.replace(/^cliproxyapi\//, ""))) {
-		if (!mid.includes("gpt-") || mid.includes("terra") || mid.includes("luna")) {
-			return true;
-		}
-	}
-	return false;
+export interface CredentialModels {
+	credential: AuthFile;
+	// null means discovery failed; [] means the registry has no models for this auth.
+	modelIds: string[] | null;
 }
 
-/** Guess which quota provider the current pi model routes to (by provider/id text). */
-export function providerFromModel(
-	model: { provider?: string; id?: string } | string | null | undefined,
-	available?: Iterable<string>,
-): string | null {
-	if (!model) return null;
-	const modelObj = typeof model === "string" ? { id: model } : model;
-	if (isKiroModel(modelObj)) return "kiro";
-	const s = `${modelObj.provider ?? ""} ${modelObj.id ?? ""}`.toLowerCase();
-	if (s.includes("claude")) {
-		if (available) {
-			const set = new Set(available);
-			if (!set.has("claude") && set.has("kiro")) return "kiro";
-		}
-		return "claude";
-	}
-	if (s.includes("gemini") || s.includes("antigravity")) return "antigravity";
-	if (s.includes("codex") || s.includes("gpt")) return "codex";
-	if (s.includes("kimi")) return "kimi";
-	if (s.includes("grok") || s.includes("xai")) return "xai";
-	return null;
+export interface QuotaStatus {
+	checkedAt?: number;
+	nextFetchAt?: number;
+	error?: string;
+	retryAt?: number;
+	rateLimited?: boolean;
+	stale: boolean;
 }
 
-/** Fetch and render quota for every known credential. Exported for test-quota.mjs. */
-export async function collectQuota(
-	base: string,
-	key: string,
-	now = Date.now(),
-	prefer?: string | null,
-	theme?: FooterTheme,
-	model?: { provider?: string; id?: string } | string | null,
-): Promise<{ blocks: string[]; footer: string }> {
-	const creds = await listCredentials(base, key);
-	const known = creds
-		.filter((c) => ADAPTERS[providerKey(c)])
-		.sort((a, b) => (providerKey(a) === "claude" ? 0 : 1) - (providerKey(b) === "claude" ? 0 : 1));
-	if (known.length === 0) throw new Error("NO_CRED");
-	const blocks: string[] = [];
-	const summaries = new Map<string, string>(); // providerKey -> one-line summary
-	for (const c of known) {
-		const pk = providerKey(c);
-		const adapter = ADAPTERS[pk];
-		const who = c.email || c.label || c.name;
-		const tag = adapter.verified ? "" : " (unverified)";
+export interface QuotaSnapshot {
+	base: string;
+	routes: CredentialModels[];
+	windows: Map<string, Win[]>; // auth_index -> windows, never merged by provider
+	statuses?: Map<string, QuotaStatus>;
+}
+
+export type AuthResolution =
+	| { kind: "auth"; credential: AuthFile; source: "trace" | "registry" }
+	| { kind: "ambiguous"; providers: string[]; count: number }
+	| { kind: "unknown"; reason: "model" | "registry" | "auth" };
+
+/** Only attribute a pi model to this proxy when its actual endpoint matches. */
+export function isProxyModel(model: ProxyModel | null | undefined, base: string): boolean {
+	if (!model?.baseUrl) return false;
+	try {
+		const endpoint = new URL(model.baseUrl);
+		const proxy = new URL(base);
+		const host = (url: URL) => ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+			? "loopback" : url.hostname;
+		const path = proxy.pathname.replace(/\/$/, "");
+		return endpoint.protocol === proxy.protocol && host(endpoint) === host(proxy) &&
+			endpoint.port === proxy.port &&
+			(endpoint.pathname === path || endpoint.pathname.startsWith(`${path}/`));
+	} catch {
+		return false;
+	}
+}
+
+/** Trace format: timestamp-auth_index-request_id. Request IDs may contain hyphens. */
+export function authIndexFromHeaders(headers: Record<string, string>): string | null {
+	const trace = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-cpa-trace-id")?.[1]?.trim();
+	// CLIProxyAPI generates 16-hex stable auth indexes; do not parse request IDs with split("-").
+	return trace?.match(/^\d{14}-([a-f\d]{16})-\S+$/i)?.[1] ?? null;
+}
+
+async function discoverCredentialModels(base: string, key: string, creds: AuthFile[], signal?: AbortSignal): Promise<CredentialModels[]> {
+	return Promise.all(creds.map(async (credential) => {
 		try {
-			const wins = await adapter.fetch(base, key, c);
-			blocks.push(`● ${who} [${pk}]${tag}`);
-			blocks.push(...renderWindows(wins, now));
-			const s = summaryFromWins(wins, now, theme, model);
-			if (s !== "Quota n/a" && !summaries.has(pk)) summaries.set(pk, s);
+			const name = encodeURIComponent(credential.name || credential.id);
+			const data = await mgmtGet<{ models?: Array<{ id?: string }> }>(base, key, `auth-files/models?name=${name}`, signal);
+			if (!Array.isArray(data.models)) throw new Error("invalid model registry response");
+			return { credential, modelIds: data.models.flatMap((m) => typeof m.id === "string" ? [m.id] : []) };
 		} catch (err) {
-			blocks.push(`● ${who} [${pk}]${tag}\n  failed: ${(err as Error).message}`);
+			if (signal?.aborted || (err as QuotaHttpError).status === 429) throw err;
+			return { credential, modelIds: null };
 		}
+	}));
+}
+
+/** Resolve candidates from the runtime registry, or the exact last selected auth from a trace. */
+export function resolveModelAuth(model: ModelHint, routes: CredentialModels[], selectedAuthIndex?: string | null): AuthResolution {
+	const enabled = routes.filter(({ credential }) => !credential.disabled);
+	if (selectedAuthIndex) {
+		const hit = enabled.find(({ credential }) => credential.auth_index === selectedAuthIndex);
+		return hit ? { kind: "auth", credential: hit.credential, source: "trace" } : { kind: "unknown", reason: "auth" };
 	}
-	// Footer follows the current model's provider; fall back to the first available.
-	// If prefer was not passed or resolved to a provider not in summaries,
-	// refine using the actual available providers.
-	const available = new Set(summaries.keys());
-	let resolvedPrefer = prefer && available.has(prefer) ? prefer : null;
-	if (!resolvedPrefer && model) {
-		const refined = providerFromModel(model, available);
-		if (refined && available.has(refined)) {
-			resolvedPrefer = refined;
+	const id = (typeof model === "string" ? model : model?.id)?.trim();
+	if (!id) return { kind: "unknown", reason: "model" };
+	// Never treat a missing/failed registry response as proof that only one auth supports the model.
+	if (enabled.some((route) => route.modelIds === null)) return { kind: "unknown", reason: "registry" };
+	const matching = (name: string) => enabled.filter((route) => route.modelIds?.includes(name));
+	let candidates = matching(id);
+	if (!candidates.length) candidates = matching(id.toLowerCase());
+	// Match full registered IDs first, then CLIProxyAPI's optional thinking suffix. Preserve prefixes.
+	if (!candidates.length) {
+		const plain = id.replace(/\([^()]*\)$/, "").trim();
+		if (plain !== id) candidates = matching(plain);
+	}
+	if (!candidates.length) return { kind: "unknown", reason: "model" };
+	if (candidates.length === 1) return { kind: "auth", credential: candidates[0].credential, source: "registry" };
+	return { kind: "ambiguous", providers: [...new Set(candidates.map(({ credential }) => providerKey(credential)))], count: candidates.length };
+}
+
+export function quotaFooter(snapshot: QuotaSnapshot, model: ModelHint, selectedAuthIndex?: string | null, now = Date.now(), theme?: FooterTheme): string {
+	const resolved = resolveModelAuth(model, snapshot.routes, selectedAuthIndex);
+	if (resolved.kind === "unknown") return resolved.reason === "registry" ? "Quota routing unavailable" : "Quota auth unknown";
+	if (resolved.kind === "ambiguous") {
+		return `Quota[${resolved.providers.join("/")}] auth pending (${resolved.count} accounts)`;
+	}
+	const cred = resolved.credential;
+	const pk = providerKey(cred);
+	const multiple = snapshot.routes.filter((r) => providerKey(r.credential) === pk && !r.credential.disabled).length > 1;
+	const label = multiple ? `${pk}:${cred.auth_index?.slice(0, 8)}` : pk;
+	const summary = summaryFromWins(snapshot.windows.get(cred.auth_index as string) ?? [], now, theme, model);
+	const status = snapshot.statuses?.get(cred.auth_index as string);
+	const note = status?.error ? ` · ${status.stale ? "stale; " : ""}${status.rateLimited ? "rate limited" : "refresh failed"}${status.retryAt ? compactReset(new Date(status.retryAt).toISOString(), now) : ""}` : "";
+	return summary.replace(/^Quota /, `Quota[${label}] `) + note;
+}
+
+const QUOTA_TTL_MS = 5 * 60_000;
+const ROUTING_THROTTLE_MS = 60_000;
+const MAX_BACKOFF_MS = 60 * 60_000;
+
+interface Flight<T> { controller: AbortController; promise: Promise<T>; users: number }
+interface AccountCache {
+	windows?: Win[];
+	checkedAt?: number;
+	retryAt: number;
+	failures: number;
+	error?: string;
+	rateLimited?: boolean;
+	flight?: Flight<void>;
+}
+interface ProxyCache {
+	routes?: CredentialModels[];
+	routesAt: number;
+	routeAttemptAt: number;
+	routeRetryAt: number;
+	routeError?: Error;
+	routeFlight?: Flight<CredentialModels[]>;
+	managementUntil: number;
+	managementFailures: number;
+	managementError?: Error;
+	accounts: Map<string, AccountCache>;
+}
+
+function scopeId(base: string, key: string): string {
+	// Isolate credentials without putting the management secret in cache keys or files.
+	return `${base.replace(/\/$/, "")}:${createHash("sha256").update(key).digest("hex")}`;
+}
+
+function joinFlight<T>(flight: Flight<T>, signal?: AbortSignal): Promise<T> {
+	signal?.throwIfAborted();
+	flight.users++;
+	return new Promise((resolve, reject) => {
+		let finished = false;
+		const finish = (error: unknown, value?: T, aborted = false) => {
+			if (finished) return;
+			finished = true;
+			signal?.removeEventListener("abort", onAbort);
+			flight.users--;
+			if (aborted && flight.users === 0) flight.controller.abort();
+			if (error !== undefined) reject(error);
+			else resolve(value as T);
+		};
+		const onAbort = () => finish(signal?.reason ?? new DOMException("Aborted", "AbortError"), undefined, true);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		flight.promise.then((value) => finish(undefined, value), (error) => finish(error));
+		if (signal?.aborted) onAbort();
+	});
+}
+
+export interface QuotaClient {
+	routing(base: string, key: string, signal?: AbortSignal, refresh?: boolean): Promise<CredentialModels[]>;
+	snapshot(base: string, key: string, routes: CredentialModels[]): QuotaSnapshot;
+	collect(base: string, key: string, now?: number, signal?: AbortSignal): Promise<{ blocks: string[]; snapshot: QuotaSnapshot }>;
+}
+
+/** Separate local routing discovery from rate-limited upstream quota, with per-auth admission control. */
+export function createQuotaClient(
+	options: { now?: () => number; random?: () => number } = {},
+	caches = new Map<string, ProxyCache>(),
+): QuotaClient {
+	const clock = options.now ?? Date.now;
+	const random = options.random ?? Math.random;
+	const cacheFor = (base: string, key: string): ProxyCache => {
+		const id = scopeId(base, key);
+		let cache = caches.get(id);
+		if (!cache) {
+			cache = { routesAt: 0, routeAttemptAt: -Infinity, routeRetryAt: 0, managementUntil: 0, managementFailures: 0, accounts: new Map() };
+			caches.set(id, cache);
 		}
+		return cache;
+	};
+	const backoff = (failures: number) => Math.min(MAX_BACKOFF_MS, QUOTA_TTL_MS * 2 ** Math.min(8, failures - 1) * (1 + random() * 0.2));
+	const managementFailure = (cache: ProxyCache, error: QuotaHttpError) => {
+		if (error.scope !== "management" || error.status !== 429) return;
+		cache.managementFailures++;
+		cache.managementError = error;
+		cache.managementUntil = Math.max(cache.managementUntil, clock() + Math.max(backoff(cache.managementFailures), retryAfterMs(error.retryAfter, clock()) ?? 0));
+	};
+	const accountStatus = (cache: ProxyCache, entry?: AccountCache): QuotaStatus => {
+		const managementBlocked = cache.managementUntil > clock();
+		const error = managementBlocked ? cache.managementError?.message : entry?.error;
+		return {
+			checkedAt: entry?.checkedAt, error,
+			nextFetchAt: Math.max(entry?.retryAt ?? 0, cache.managementUntil) || undefined,
+			rateLimited: managementBlocked || entry?.rateLimited,
+			retryAt: error ? Math.max(entry?.retryAt ?? 0, managementBlocked ? cache.managementUntil : 0) : undefined,
+			stale: Boolean(entry?.windows && (error || clock() - (entry.checkedAt ?? 0) >= QUOTA_TTL_MS)),
+		};
+	};
+
+	async function routing(base: string, key: string, signal?: AbortSignal, refresh = false): Promise<CredentialModels[]> {
+		signal?.throwIfAborted();
+		base = base.replace(/\/$/, "");
+		const cache = cacheFor(base, key);
+		if (cache.routeFlight && !cache.routeFlight.controller.signal.aborted) return joinFlight(cache.routeFlight, signal);
+		if (cache.managementUntil > clock()) {
+			if (cache.routes) return cache.routes;
+			throw cache.managementError;
+		}
+		if (cache.routes && ((!refresh && clock() - cache.routesAt < QUOTA_TTL_MS) || clock() - cache.routeAttemptAt < ROUTING_THROTTLE_MS)) return cache.routes;
+		if (cache.routeRetryAt > clock()) {
+			if (cache.routes) return cache.routes;
+			throw cache.routeError;
+		}
+		cache.routeAttemptAt = clock();
+		const controller = new AbortController();
+		const flight: Flight<CredentialModels[]> = { controller, users: 0, promise: Promise.resolve().then(async () => {
+			try {
+				const creds = await listCredentials(base, key, controller.signal);
+				controller.signal.throwIfAborted();
+				const routes = await discoverCredentialModels(base, key, creds, controller.signal);
+				controller.signal.throwIfAborted();
+				cache.routes = routes;
+				cache.routesAt = clock();
+				cache.routeRetryAt = 0;
+				cache.routeError = undefined;
+				return routes;
+			} catch (err) {
+				if (!controller.signal.aborted) {
+					cache.routeError = err as Error;
+					cache.routeRetryAt = clock() + ROUTING_THROTTLE_MS;
+					managementFailure(cache, err as QuotaHttpError);
+				}
+				throw err;
+			}
+		}).finally(() => { if (cache.routeFlight === flight) cache.routeFlight = undefined; }) };
+		cache.routeFlight = flight;
+		return joinFlight(flight, signal);
 	}
-	const actual = resolvedPrefer ?? [...summaries.keys()][0];
-	const hit = actual !== undefined ? summaries.get(actual) : undefined;
-	const footer =
-		hit && actual
-			? (summaries.size > 1 || actual !== prefer
-				? hit.replace("Quota ", `Quota[${actual}] `)
-				: hit)
-			: "";
-	return { blocks, footer };
+
+	function snapshot(base: string, key: string, routes: CredentialModels[]): QuotaSnapshot {
+		const cache = cacheFor(base, key);
+		// Discovery may complete while a long collection is still fetching account quotas.
+		// Never publish an older credential list over a newer registry result.
+		routes = cache.routes ?? routes;
+		const windows = new Map<string, Win[]>();
+		const statuses = new Map<string, QuotaStatus>();
+		for (const { credential } of routes) {
+			const index = credential.auth_index as string;
+			const entry = cache.accounts.get(index);
+			if (entry?.windows) windows.set(index, entry.windows);
+			statuses.set(index, accountStatus(cache, entry));
+		}
+		return { base: base.replace(/\/$/, ""), routes, windows, statuses };
+	}
+
+	async function quota(base: string, key: string, cred: AuthFile, signal?: AbortSignal): Promise<void> {
+		signal?.throwIfAborted();
+		const cache = cacheFor(base, key);
+		const index = cred.auth_index as string;
+		if (cache.routes && !cache.routes.some((r) => r.credential.auth_index === index && !r.credential.disabled)) return;
+		let entry = cache.accounts.get(index);
+		if (!entry) { entry = { retryAt: 0, failures: 0 }; cache.accounts.set(index, entry); }
+		if (entry.flight && !entry.flight.controller.signal.aborted) return joinFlight(entry.flight, signal);
+		if (cache.managementUntil > clock() || entry.retryAt > clock()) return;
+		// Every admitted attempt, including one interrupted after sending, has a minimum spacing.
+		entry.retryAt = clock() + QUOTA_TTL_MS;
+		const controller = new AbortController();
+		const account = entry;
+		const flight: Flight<void> = { controller, users: 0, promise: Promise.resolve().then(async () => {
+			try {
+				controller.signal.throwIfAborted();
+				const wins = await ADAPTERS[providerKey(cred)].fetch(base, key, cred, controller.signal);
+				controller.signal.throwIfAborted();
+				account.windows = wins;
+				account.checkedAt = clock();
+				// Keep admission-based spacing; completion latency must not add another TTL.
+				account.failures = 0;
+				account.error = undefined;
+				account.rateLimited = false;
+				if (cache.managementUntil <= clock()) cache.managementFailures = 0;
+			} catch (err) {
+				if (controller.signal.aborted) {
+					account.error = "refresh interrupted";
+					throw err;
+				}
+				const error = err as QuotaHttpError;
+				account.error = error.message;
+				account.rateLimited = error.status === 429;
+				if (account.rateLimited) {
+					account.failures++;
+					account.retryAt = clock() + Math.max(backoff(account.failures), retryAfterMs(error.retryAfter, clock()) ?? 0);
+				}
+				managementFailure(cache, error);
+			}
+		}).finally(() => { if (account.flight === flight) account.flight = undefined; }) };
+		account.flight = flight;
+		return joinFlight(flight, signal);
+	}
+
+	async function collect(base: string, key: string, now = clock(), signal?: AbortSignal): Promise<{ blocks: string[]; snapshot: QuotaSnapshot }> {
+		base = base.replace(/\/$/, "");
+		const routes = await routing(base, key, signal);
+		signal?.throwIfAborted();
+		const known = routes.map((r) => r.credential).filter((c) => ADAPTERS[providerKey(c)])
+			.sort((a, b) => (providerKey(a) === "claude" ? 0 : 1) - (providerKey(b) === "claude" ? 0 : 1));
+		if (!known.length) throw new Error("NO_CRED");
+		for (const cred of known) {
+			signal?.throwIfAborted();
+			await quota(base, key, cred, signal);
+		}
+		signal?.throwIfAborted();
+		const result = snapshot(base, key, routes);
+		const blocks: string[] = [];
+		for (const cred of known) {
+			const index = cred.auth_index as string;
+			const pk = providerKey(cred);
+			const status = result.statuses?.get(index);
+			const wins = result.windows.get(index);
+			const heading = `● ${cred.email || cred.label || cred.name} [${pk}]${ADAPTERS[pk].verified ? "" : " (unverified)"}`;
+			blocks.push(heading + (status?.stale ? " (cached, stale)" : ""));
+			if (wins) blocks.push(...renderWindows(wins, now));
+			if (status?.error) blocks.push(`  failed: ${status.error}${status.retryAt ? ` · ${formatReset(new Date(status.retryAt).toISOString(), now).replace("resets", "retry")}` : ""}`);
+			else if (!wins) blocks.push("  (quota refresh pending)");
+		}
+		return { blocks, snapshot: result };
+	}
+	return { routing, snapshot, collect };
+}
+
+// Survive extension reloads/duplicate loads in the same process. No secrets are persisted to disk.
+const cacheSymbol = Symbol.for("pi-cliproxyapi-quota.cache.v1");
+const processCache = globalThis as typeof globalThis & { [key: symbol]: Map<string, ProxyCache> | undefined };
+const defaultQuotaClient = createQuotaClient({}, processCache[cacheSymbol] ??= new Map());
+
+export async function collectQuota(
+	base: string, key: string, now = Date.now(), selectedAuthIndex?: string | null,
+	theme?: FooterTheme, model?: ModelHint, options: { signal?: AbortSignal; client?: QuotaClient } = {},
+): Promise<{ blocks: string[]; footer: string; snapshot: QuotaSnapshot }> {
+	const result = await (options.client ?? defaultQuotaClient).collect(base, key, now, options.signal);
+	return { ...result, footer: quotaFooter(result.snapshot, model, selectedAuthIndex, now, theme) };
 }
 
 // ---------- rendering ----------
@@ -865,89 +1136,211 @@ function isPrimaryUiSession(ctx: ExtensionContext): boolean {
 	return ctx.hasUI && ctx.mode === "tui";
 }
 
-export default function (pi: ExtensionAPI): void {
-	// Switching models switches the footer to that provider's quota immediately.
-	pi.on("model_select", (_e, ctx) => {
-		if (footerTimer !== undefined) startFooterRefresh(ctx);
-	});
-
-	// ----- /quota -----
+export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaClient): void {
 	const QUOTA_KEY = "cliproxy-quota";
-	const FOOTER_REFRESH_MS = 5 * 60_000;
-	let footerTimer: ReturnType<typeof setInterval> | undefined;
-	let footerRevision = 0;
+	let footerTimer: ReturnType<typeof setTimeout> | undefined;
+	let timerGeneration = 0;
+	let lifecycle = new AbortController();
+	let background = new AbortController();
+	let connectionLifetime = new AbortController();
+	let active = false;
+	let activeCtx: ExtensionContext | undefined;
+	let connectionScope: string | undefined;
+	let snapshotScope: string | undefined;
+	let routingRevision = 0;
+	let snapshot: QuotaSnapshot | undefined;
+	let selectedAuthIndex: string | null = null;
+	let requestRun: { revision: number; modelKey: string; scope: string } | undefined;
+	let pendingRequest: typeof requestRun;
 
-	async function collectUsage(
-		now: number,
-		prefer?: string | null,
-		theme?: FooterTheme,
-		model?: { provider?: string; id?: string } | string | null,
-	): Promise<{ blocks: string[]; footer: string }> {
-		const base = resolveBaseUrl();
+	const modelKey = (model: ProxyModel | undefined) => JSON.stringify([model?.provider, model?.id, model?.baseUrl]);
+	const currentScope = () => scopeId(resolveBaseUrl(), resolveManagementKey() ?? "");
+
+	function connection(): { base: string; key: string; scope: string } {
+		const base = resolveBaseUrl().replace(/\/$/, "");
 		const key = resolveManagementKey();
 		if (!key) throw new Error("NO_KEY");
-		return collectQuota(base, key, now, prefer, theme, model);
+		const scope = scopeId(base, key);
+		if (connectionScope !== scope) {
+			background.abort();
+			connectionLifetime.abort();
+			background = new AbortController();
+			connectionLifetime = new AbortController();
+			connectionScope = scope;
+			snapshot = undefined;
+			selectedAuthIndex = null;
+		}
+		return { base, key, scope };
 	}
 
-	// silent=true only refreshes the footer (used for periodic auto-refresh).
-	async function runQuota(ctx: ExtensionContext, silent = false): Promise<void> {
-		const revision = ++footerRevision;
-		if (!silent) ctx.ui.notify("Fetching quota…", "info");
+	function updateFooter(ctx: ExtensionContext): void {
+		if (!isPrimaryUiSession(ctx)) return;
+		if (!isProxyModel(ctx.model, resolveBaseUrl())) {
+			ctx.ui.setStatus(QUOTA_KEY, undefined);
+			return;
+		}
+		const footer = snapshot && snapshotScope === currentScope()
+			? quotaFooter(snapshot, ctx.model, selectedAuthIndex, Date.now(), ctx.ui.theme)
+			: "Quota routing unavailable";
+		ctx.ui.setStatus(QUOTA_KEY, ctx.ui.theme.fg("dim", footer));
+	}
+
+	async function refreshRouting(ctx: ExtensionContext, refresh = false): Promise<void> {
+		if (!active || !isPrimaryUiSession(ctx) || !isProxyModel(ctx.model, resolveBaseUrl())) return;
+		const session = lifecycle;
+		let signal: AbortSignal | undefined;
 		try {
-			const theme = isPrimaryUiSession(ctx) ? ctx.ui.theme : undefined;
-			const { blocks, footer } = await collectUsage(
-				Date.now(),
-				providerFromModel(ctx.model),
-				theme,
-				ctx.model,
-			);
-			if (!silent) ctx.ui.notify(`Subscription quota\n${blocks.join("\n")}`, "info");
-			if (footer && isPrimaryUiSession(ctx) && revision === footerRevision) {
-				ctx.ui.setStatus(QUOTA_KEY, ctx.ui.theme.fg("dim", footer));
-			}
-		} catch (err) {
-			if (silent) return;
-			const msg = (err as Error).message;
-			if (msg === "NO_KEY") {
-				ctx.ui.notify(
-					'Management key not found. Set CLIPROXYAPI_MANAGEMENT_KEY, or write {"managementKey":"..."} to ~/.pi/agent/cliproxyapi-quota.json, or make sure the EasyCLIProxyAPI GUI has a management-secret-key configured.',
-					"error",
-				);
-			} else if (msg === "NO_CRED") {
-				ctx.ui.notify(
-					"No usable OAuth credential found (claude / codex / antigravity / gemini / kimi / xai / kiro).",
-					"warning",
-				);
-			} else {
-				ctx.ui.notify(`Failed to fetch quota: ${msg}`, "error");
-			}
+			const { base, key, scope } = connection();
+			signal = AbortSignal.any([session.signal, background.signal, connectionLifetime.signal]);
+			// Missing auth traces only refresh the LOCAL registry, coalesced/throttled by the client.
+			const routes = await client.routing(base, key, signal, refresh);
+			signal.throwIfAborted();
+			if (session !== lifecycle || scope !== currentScope()) return;
+			snapshot = client.snapshot(base, key, routes);
+			snapshotScope = scope;
+			updateFooter(activeCtx ?? ctx);
+		} catch {
+			if (!signal?.aborted && session === lifecycle && active) updateFooter(activeCtx ?? ctx);
 		}
 	}
 
-	function stopFooterRefresh(): void {
-		if (footerTimer !== undefined) clearInterval(footerTimer);
+	async function runQuota(ctx: ExtensionContext, silent = false): Promise<void> {
+		if (!active || (silent && !isProxyModel(ctx.model, resolveBaseUrl()))) return;
+		const session = lifecycle;
+		let signal: AbortSignal | undefined;
+		if (!silent) ctx.ui.notify("Fetching quota (up to 5-minute cache)…", "info");
+		try {
+			const { base, key, scope } = connection();
+			signal = AbortSignal.any(silent ? [session.signal, background.signal, connectionLifetime.signal] : [session.signal, connectionLifetime.signal]);
+			const result = await client.collect(base, key, Date.now(), signal);
+			signal.throwIfAborted();
+			if (session !== lifecycle || scope !== currentScope()) return;
+			snapshot = result.snapshot;
+			snapshotScope = scope;
+			if (!silent) ctx.ui.notify(`Subscription quota\n${result.blocks.join("\n")}`, "info");
+			// Quota is account-scoped, so an ongoing refresh safely renders the newly selected model.
+			updateFooter(activeCtx ?? ctx);
+		} catch (err) {
+			if (signal?.aborted || session !== lifecycle || !active) return;
+			const msg = (err as Error).message;
+			if (msg === "NO_CRED") {
+				snapshot = undefined;
+				selectedAuthIndex = null;
+				updateFooter(activeCtx ?? ctx);
+			} else if (!snapshot) updateFooter(activeCtx ?? ctx);
+			if (silent) return;
+			if (msg === "NO_KEY") {
+				ctx.ui.notify('Management key not found. Set CLIPROXYAPI_MANAGEMENT_KEY or configure ~/.pi/agent/cliproxyapi-quota.json / EasyCLIProxyAPI.', "error");
+			} else if (msg === "NO_CRED") {
+				ctx.ui.notify("No usable OAuth credential found (claude / codex / antigravity / gemini / kimi / xai / kiro).", "warning");
+			} else ctx.ui.notify(`Failed to fetch quota: ${msg}`, "error");
+		}
+	}
+
+	function clearTimer(): void {
+		if (footerTimer !== undefined) clearTimeout(footerTimer);
 		footerTimer = undefined;
-		// Ignore any response still in flight from the old session/model.
-		footerRevision++;
+		timerGeneration++;
 	}
 
-	// Populate on session load, then refresh every 5 minutes without turn events.
-	function startFooterRefresh(ctx: ExtensionContext): void {
-		stopFooterRefresh();
-		if (!isPrimaryUiSession(ctx)) return;
-		void runQuota(ctx, true);
-		footerTimer = setInterval(() => void runQuota(ctx, true), FOOTER_REFRESH_MS);
-		footerTimer.unref();
+	function nextPollDelay(): number {
+		const now = Date.now();
+		const future = [...(snapshot?.statuses?.values() ?? [])]
+			.flatMap((s) => s.nextFetchAt && s.nextFetchAt > now ? [s.nextFetchAt - now] : []);
+		return Math.max(1000, Math.min(QUOTA_TTL_MS, ...future));
 	}
-	pi.on("session_start", (_e, ctx) => startFooterRefresh(ctx));
-	pi.on("session_shutdown", () => stopFooterRefresh());
 
-	// Works while streaming: shortcut fetches and shows quota immediately.
-	pi.registerShortcut("ctrl+shift+q", {
-		description: "Show subscription quota (all OAuth providers)",
-		handler: (ctx) => runQuota(ctx),
+	function schedule(ctx: ExtensionContext, initialQuota: boolean): void {
+		clearTimer();
+		activeCtx = ctx;
+		updateFooter(ctx);
+		if (!isPrimaryUiSession(ctx) || !isProxyModel(ctx.model, resolveBaseUrl())) {
+			background.abort();
+			return;
+		}
+		if (background.signal.aborted) background = new AbortController();
+		const generation = timerGeneration;
+		const arm = () => {
+			if (!active || generation !== timerGeneration || background.signal.aborted) return;
+			footerTimer = setTimeout(() => void poll(), nextPollDelay());
+			footerTimer.unref();
+		};
+		const poll = async () => {
+			if (activeCtx) await runQuota(activeCtx, true);
+			arm();
+		};
+		if (initialQuota) void poll();
+		else {
+			void refreshRouting(ctx); // Model switches never fetch upstream quota.
+			arm();
+		}
+	}
+
+	function resetSession(): void {
+		clearTimer();
+		lifecycle.abort();
+		background.abort();
+		connectionLifetime.abort();
+		lifecycle = new AbortController();
+		background = new AbortController();
+		connectionLifetime = new AbortController();
+		routingRevision++;
+		requestRun = undefined;
+		pendingRequest = undefined;
+		selectedAuthIndex = null;
+		snapshot = undefined;
+		snapshotScope = undefined;
+	}
+
+	pi.on("model_select", (_e, ctx) => {
+		if (!active) return;
+		routingRevision++;
+		selectedAuthIndex = null;
+		pendingRequest = undefined;
+		schedule(ctx, false);
+	});
+	pi.on("session_start", (_e, ctx) => {
+		resetSession();
+		active = true;
+		schedule(ctx, true);
+	});
+	pi.on("session_shutdown", (_e, ctx) => {
+		active = false;
+		resetSession();
+		activeCtx = undefined;
+		if (isPrimaryUiSession(ctx)) ctx.ui.setStatus(QUOTA_KEY, undefined);
 	});
 
+	pi.on("before_agent_start", (_e, ctx) => {
+		requestRun = { revision: routingRevision, modelKey: modelKey(ctx.model), scope: currentScope() };
+	});
+	pi.on("agent_settled", () => {
+		requestRun = undefined;
+		pendingRequest = undefined;
+	});
+	pi.on("before_provider_request", (event, ctx) => {
+		const payload = event.payload;
+		const outgoingModel = payload && typeof payload === "object" && "model" in payload && typeof payload.model === "string"
+			? payload.model : undefined;
+		pendingRequest = active && requestRun?.revision === routingRevision && requestRun.modelKey === modelKey(ctx.model) &&
+			requestRun.scope === currentScope() && (!outgoingModel || outgoingModel === ctx.model?.id) && isProxyModel(ctx.model, resolveBaseUrl())
+			? { ...requestRun } : undefined;
+		// Ignore unbound idle warming and requests prepared by a model-switched run.
+		if (!pendingRequest) return;
+		selectedAuthIndex = null;
+		updateFooter(ctx);
+	});
+	pi.on("after_provider_response", (event, ctx) => {
+		if (!active || !pendingRequest || pendingRequest.revision !== routingRevision || pendingRequest.modelKey !== modelKey(ctx.model) ||
+			pendingRequest.scope !== currentScope() || !isProxyModel(ctx.model, resolveBaseUrl())) return;
+		selectedAuthIndex = event.status >= 200 && event.status < 300 ? authIndexFromHeaders(event.headers) : null;
+		updateFooter(ctx);
+		if (selectedAuthIndex && !snapshot?.routes.some((r) => r.credential.auth_index === selectedAuthIndex)) void refreshRouting(ctx, true);
+	});
+
+	pi.registerShortcut("ctrl+shift+q", {
+		description: "Show subscription quota (all OAuth providers)", handler: (ctx) => runQuota(ctx),
+	});
 	pi.registerCommand("quota", {
 		description: "Show subscription quota for all OAuth providers (via CLIProxyAPI)",
 		handler: async (_args, ctx) => runQuota(ctx),

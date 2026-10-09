@@ -32,6 +32,16 @@ A pi extension that allows setups routing subscriptions into pi through CLIProxy
 Add this directory's `index.ts` absolute path to the `extensions` array in
 `~/.pi/agent/settings.json`, then restart pi (or `/reload`).
 
+## Dynamic routing
+
+- Discover model → credential candidates with `GET /v0/management/auth-files/models?name=<name>` for every enabled credential, including providers without quota adapters. Never infer the routing provider from model-family names or pi provider labels.
+- Resolve the selected credential from HTTP response `X-CPA-TRACE-ID` (`timestamp-auth_index-request_id`) through pi's `after_provider_response` event. Store quota windows by `auth_index`, not by provider.
+- Multiple candidates, missing discovery, or unknown auth must not fall back to the first account. Model/session changes clear trace selection and invalidate late refreshes. Automatic footer updates require the model endpoint to match the configured proxy.
+- Model switches and unknown trace auth refresh local routing only (unknown traces are throttled to once/minute). They must never trigger an upstream quota scan.
+- `createQuotaClient` provides process-shared per-auth cache/single-flight and minimum five-minute request spacing, including manual commands. Preserve successful windows and mark them stale on failure; respect upstream `Retry-After` and exponential 429 backoff. Management HTTP 429 establishes proxy-level cooldown.
+- Lifecycle/connection cancellation must stop later registry/adapter requests, without aborting shared work still needed by another subscriber. Cache/cooldowns survive same-process reload; separate processes are not coordinated.
+- `npm test` runs offline formatter, routing, lifecycle, throttling, cooldown, and cancellation tests; no credentials or live proxy needed. Do not run live quota smoke tests while debugging a 429.
+
 ## Verification
 
 - `node test-quota.mjs` hits the live proxy and prints the rendered quota (also unit-checks the pure

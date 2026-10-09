@@ -3,6 +3,9 @@
   "version": "0.2.7",
   "description": "Pi extension: view subscription quota for every OAuth provider CLIProxyAPI holds (Claude, Antigravity/Gemini, Codex, Kimi, xAI, Kiro) inside pi.",
   "type": "module",
+  "scripts": {
+    "test": "node test-quota.mjs --offline && node --test test-footer.mjs test-rate-limit.mjs"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
