@@ -12,6 +12,7 @@ import {
 	formatReset,
 	parseCodexUsage,
 	parseQuotaSummary,
+	ANTIGRAVITY_UA,
 	parseKiroUsage,
 	kiroWindowLabel,
 	selectBestGroup,
@@ -225,6 +226,8 @@ const agJson = JSON.stringify({
 		},
 	],
 });
+// Upstream omits the Gemini group for the legacy antigravity/cli UA; keep the panel UA.
+assert.match(ANTIGRAVITY_UA, /^antigravity\/hub\//);
 const agWins = parseQuotaSummary(agJson);
 console.assert(agWins.length === 4, "antigravity parse length");
 console.assert(agWins[0].group === "Gemini Models", "antigravity group parsed");

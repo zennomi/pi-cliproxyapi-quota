@@ -266,7 +266,9 @@ const ANTIGRAVITY_HOSTS = [
 	"https://daily-cloudcode-pa.sandbox.googleapis.com",
 	"https://cloudcode-pa.googleapis.com",
 ];
-const ANTIGRAVITY_UA = "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)";
+// Must match the CPA panel's UA: upstream filters quota groups by client. The old
+// `antigravity/cli/...` UA only returned "Claude and GPT models" (Gemini group missing).
+export const ANTIGRAVITY_UA = "antigravity/hub/2.23.0 darwin/arm64";
 
 export function parseQuotaSummary(body: string): Win[] {
 	const data = JSON.parse(body) as {
