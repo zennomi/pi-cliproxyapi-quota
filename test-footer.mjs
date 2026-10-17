@@ -61,6 +61,8 @@ function setup(t) {
 		}
 		assert.ok(url.pathname.endsWith("/api-call"));
 		const body = JSON.parse(options.body);
+		if (body.url.includes("cedar_ember=")) return Response.json({ status_code: 200, body: JSON.stringify({ cedar_ember: { eligible: false, grants: [] } }) });
+		if (body.url.endsWith("/rate-limit-reset-credits")) return Response.json({ status_code: 200, body: JSON.stringify({ available_count: 0, credits: [] }) });
 		usageRequests.set(body.authIndex, (usageRequests.get(body.authIndex) ?? 0) + 1);
 		usageTimes.set(body.authIndex, [...(usageTimes.get(body.authIndex) ?? []), now]);
 		if (quotaFailures.has(body.authIndex)) return Response.json({ error: "unavailable" }, { status: 503 });
@@ -143,7 +145,7 @@ test("load and idle 5-minute polling use runtime registry, not model names", asy
 	assert.equal(h.timers.size, 0, "no timer started in factory");
 	await h.emit("session_start");
 	assert.equal(h.requests, 1);
-	assert.ok(h.footer.startsWith("Quota[claude] 5h"));
+	assert.ok(h.footer.startsWith("claude 5h"));
 	assert.equal(h.timers.size, 1);
 	assert.equal([...h.timers.keys()][0].unref.mock.callCount(), 1);
 	await h.emit("before_agent_start");
@@ -165,14 +167,14 @@ test("model switches replace timers, clear old auth immediately, and session shu
 	await h.emit("model_select", codexCtx);
 	assert.equal(h.timers.size, 1);
 	assert.ok(!h.timers.has(firstTimer));
-	assert.ok(h.footer.startsWith("Quota[codex]"));
+	assert.ok(h.footer.startsWith("codex "));
 	await h.response(CLAUDE, codexCtx); // late response, with no request for the new model
-	assert.ok(h.footer.startsWith("Quota[codex]"));
+	assert.ok(h.footer.startsWith("codex "));
 	await h.tick();
-	assert.ok(h.footer.startsWith("Quota[codex]"));
+	assert.ok(h.footer.startsWith("codex "));
 	await h.emit("session_start");
 	assert.equal(h.timers.size, 1);
-	assert.ok(h.footer.startsWith("Quota[claude]"));
+	assert.ok(h.footer.startsWith("claude "));
 	await h.emit("session_shutdown");
 	await h.emit("session_shutdown");
 	assert.equal(h.timers.size, 0);
@@ -217,18 +219,18 @@ test("shared model remains pending until a trace selects the real provider witho
 	const h = setup(t);
 	h.ctx.model = proxyModel("shared");
 	await h.emit("session_start");
-	assert.equal(h.footer, "Quota[claude/codex] auth pending (2 accounts)");
+	assert.equal(h.footer, "claude/codex auth pending (2 accounts)");
 	await h.emit("before_provider_request");
 	const requests = h.allRequests;
 	await h.response(CODEX);
-	assert.ok(h.footer.startsWith("Quota[codex] 5h ━━━━── 60%"));
+	assert.ok(h.footer.startsWith("codex 5h ━━━━── 60%"));
 	assert.equal(h.allRequests, requests, "header observation does not block on fetching quota");
 	await h.tick();
-	assert.ok(h.footer.startsWith("Quota[codex]"), "periodic refresh retains selected auth");
+	assert.ok(h.footer.startsWith("codex "), "periodic refresh retains selected auth");
 	await h.emit("before_provider_request");
-	assert.equal(h.footer, "Quota[claude/codex] auth pending (2 accounts)");
+	assert.equal(h.footer, "claude/codex auth pending (2 accounts)");
 	await h.response(CLAUDE);
-	assert.ok(h.footer.startsWith("Quota[claude] 5h ━━━━━─ 80%"));
+	assert.ok(h.footer.startsWith("claude 5h ━━━━━─ 80%"));
 });
 
 test("same-provider accounts keep separate quota windows and never choose the first account", async (t) => {
@@ -239,10 +241,10 @@ test("same-provider accounts keep separate quota windows and never choose the fi
 	];
 	h.models.set(SECOND, ["friendly-alias"]);
 	await h.emit("session_start");
-	assert.equal(h.footer, "Quota[claude] auth pending (2 accounts)");
+	assert.equal(h.footer, "claude auth pending (2 accounts)");
 	await h.emit("before_provider_request");
 	await h.response(SECOND);
-	assert.ok(h.footer.startsWith("Quota[claude:22222222] 5h ━───── 10%"));
+	assert.ok(h.footer.startsWith("claude:22222222 5h ━───── 10%"));
 	await h.tick();
 	assert.ok(h.footer.includes("10%"));
 });
@@ -268,7 +270,7 @@ test("unknown trace auth refreshes credentials but does not fall back to a known
 	await h.emit("session_start");
 	await h.emit("before_provider_request");
 	await h.response("9999999999999999");
-	assert.equal(h.footer, "Quota auth unknown");
+	assert.equal(h.footer, "auth unknown");
 	assert.equal(h.requests, 1, "unknown-auth discovery is throttled after startup and never fetches quota");
 	assert.equal(h.usageRequests.get(CLAUDE), 1);
 });
@@ -284,7 +286,7 @@ test("refresh completing after a trace uses the latest selected auth", async (t)
 	await h.response(CODEX);
 	release();
 	await setImmediate();
-	assert.ok(h.footer.startsWith("Quota[codex]"));
+	assert.ok(h.footer.startsWith("codex "));
 });
 
 test("late quota and trace responses cannot update a shut-down session", async (t) => {
@@ -307,20 +309,20 @@ test("partial registry failures stay unknown, but a valid trace can still resolv
 	const h = setup(t);
 	h.registryFailures.add(CODEX);
 	await h.emit("session_start");
-	assert.equal(h.footer, "Quota routing unavailable");
+	assert.equal(h.footer, "routing unavailable");
 	await h.emit("before_provider_request");
 	await h.response(CLAUDE);
-	assert.ok(h.footer.startsWith("Quota[claude]"));
+	assert.ok(h.footer.startsWith("claude "));
 });
 
 test("a selected account's quota error never displays another account's quota", async (t) => {
 	const h = setup(t);
 	h.quotaFailures.add(CLAUDE);
 	await h.emit("session_start");
-	assert.ok(h.footer.startsWith("Quota[claude] n/a · refresh failed"));
+	assert.ok(h.footer.startsWith("claude n/a · refresh failed"));
 	await h.emit("before_provider_request");
 	await h.response(CLAUDE);
-	assert.ok(h.footer.startsWith("Quota[claude] n/a · refresh failed"));
+	assert.ok(h.footer.startsWith("claude n/a · refresh failed"));
 });
 
 test("credentials without quota adapters still participate in routing ambiguity", async (t) => {
@@ -331,10 +333,10 @@ test("credentials without quota adapters still participate in routing ambiguity"
 	];
 	h.models.set(SECOND, ["friendly-alias"]);
 	await h.emit("session_start");
-	assert.equal(h.footer, "Quota[claude/custom-provider] auth pending (2 accounts)");
+	assert.equal(h.footer, "claude/custom-provider auth pending (2 accounts)");
 	await h.emit("before_provider_request");
 	await h.response(SECOND);
-	assert.equal(h.footer, "Quota[custom-provider] n/a");
+	assert.equal(h.footer, "custom-provider n/a");
 });
 
 test("disabled and index-less credentials do not affect discovery", async (t) => {
@@ -346,8 +348,8 @@ test("disabled and index-less credentials do not affect discovery", async (t) =>
 	];
 	h.models.set(SECOND, ["friendly-alias"]);
 	await h.emit("session_start");
-	assert.ok(h.footer.startsWith("Quota[claude]"));
-	assert.equal(h.allRequests, 3, "one list, one registry, one quota request");
+	assert.ok(h.footer.startsWith("claude "));
+	assert.equal(h.allRequests, 4, "one list, one registry, one quota request, one manual reset read");
 });
 
 test("removing all credentials clears previously cached account quota", async (t) => {
@@ -355,10 +357,10 @@ test("removing all credentials clears previously cached account quota", async (t
 	await h.emit("session_start");
 	await h.emit("before_provider_request");
 	await h.response(CLAUDE);
-	assert.ok(h.footer.startsWith("Quota[claude]"));
+	assert.ok(h.footer.startsWith("claude "));
 	h.files = [];
 	await h.tick();
-	assert.equal(h.footer, "Quota routing unavailable");
+	assert.equal(h.footer, "routing unavailable");
 });
 
 test("headless trace observation never starts automatic management requests", async (t) => {
@@ -376,16 +378,16 @@ test("an old request prepared after model_select cannot be attributed to the new
 	await h.emit("before_agent_start"); // Run A starts preparing a request for friendly-alias.
 	h.ctx.model = proxyModel("gpt-5.6-terra"); // Context getters now expose model B.
 	await h.emit("model_select");
-	assert.ok(h.footer.startsWith("Quota[codex]"));
+	assert.ok(h.footer.startsWith("codex "));
 	// Even a protocol with no model field must reject the entire switched run.
 	await h.emit("before_provider_request", h.ctx, { payload: {} });
 	await h.response(CLAUDE);
-	assert.ok(h.footer.startsWith("Quota[codex]"));
+	assert.ok(h.footer.startsWith("codex "));
 	// A later, genuinely new run can resolve traces again.
 	await h.emit("agent_settled");
 	await h.emit("before_provider_request", h.ctx, { payload: { model: "gpt-5.6-terra" } });
 	await h.response(CODEX);
-	assert.ok(h.footer.startsWith("Quota[codex]"));
+	assert.ok(h.footer.startsWith("codex "));
 });
 
 test("idle cache warming without a new run preserves the last safely selected auth", async (t) => {
@@ -401,7 +403,7 @@ test("idle cache warming without a new run preserves the last safely selected au
 	await h.handlers.get("before_provider_request")({ payload: { model: "shared" } }, h.ctx);
 	await h.response(CLAUDE);
 	assert.equal(h.footer, footer);
-	assert.ok(h.footer.startsWith("Quota[codex]"));
+	assert.ok(h.footer.startsWith("codex "));
 	assert.equal(h.allRequests, requests);
 });
 
@@ -411,7 +413,7 @@ test("outgoing payload model mismatches cannot overwrite the current model's aut
 	await h.emit("session_start");
 	await h.emit("before_provider_request", h.ctx, { payload: { model: "friendly-alias" } });
 	await h.response(CLAUDE);
-	assert.ok(h.footer.startsWith("Quota[codex]"));
+	assert.ok(h.footer.startsWith("codex "));
 });
 
 test("request latency does not turn five-minute polling into ten-minute polling", async (t) => {
@@ -451,7 +453,7 @@ test("repeated unknown traces perform only throttled local discovery", async (t)
 	assert.equal(h.requests, 2, "one additional discovery for all ten responses");
 	assert.equal(h.usageRequests.get(CLAUDE), 1);
 	assert.equal(h.usageRequests.get(CODEX), 1);
-	assert.equal(h.footer, "Quota auth unknown");
+	assert.equal(h.footer, "auth unknown");
 });
 
 test("discovering a new trace auth does not refetch existing account quota", async (t) => {
@@ -465,7 +467,7 @@ test("discovering a new trace auth does not refetch existing account quota", asy
 	h.models.set(SECOND, ["friendly-alias"]);
 	await h.emit("before_provider_request");
 	await h.response(SECOND);
-	assert.ok(h.footer.startsWith("Quota[claude:22222222] n/a"));
+	assert.ok(h.footer.startsWith("claude:22222222 n/a"));
 	assert.equal(h.usageRequests.get(CLAUDE), 1);
 	assert.equal(h.usageRequests.get(SECOND), undefined);
 	await h.commands.get("quota").handler("", h.ctx);
@@ -516,4 +518,32 @@ test("old quota refresh cannot overwrite a newly selected model", async (t) => {
 	release();
 	await setImmediate();
 	assert.ok(h.footer.includes("auth pending"));
+});
+
+test("quota renders as its own line below the built-in footer, without setStatus", async (t) => {
+	const h = setup(t);
+	const builtin = { render: () => ["pwd-line", "stats-line", "other-status"], setAutoCompactEnabled() {}, setSession() {} };
+	let footer;
+	let renders = 0;
+	const tui = { children: [{ children: [{}] }, { children: [builtin] }], requestRender: () => renders++ };
+	h.ctx.ui.setWidget = (_key, factory) => factory?.(tui, {});
+	h.ctx.ui.setFooter = (factory) => {
+		footer?.dispose?.();
+		footer = factory ? factory(tui, {}, {}) : undefined;
+	};
+	await h.emit("session_start");
+	assert.equal(h.statuses.length, 0, "shared status line untouched");
+	const lines = footer.render(200);
+	assert.deepEqual(lines.slice(0, 2), ["pwd-line", "stats-line"]);
+	assert.ok(lines[2].startsWith("claude 5h"), lines[2]);
+	assert.equal(lines[3], "other-status");
+	assert.ok(renders > 0);
+	assert.ok(footer.render(10)[2].endsWith("…"), "truncated to width");
+
+	h.ctx.ui.setFooter(() => ({ render: () => ["someone else"] }));
+	await h.commands.get("quota").handler("", h.ctx);
+	assert.ok(h.footer.startsWith("claude "), "falls back to setStatus once replaced");
+
+	await h.emit("session_shutdown");
+	assert.equal(h.footer, undefined);
 });

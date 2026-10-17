@@ -41,7 +41,10 @@ function setup(t, two = false) {
 			return Response.json({ models: [{ id: "shared" }] });
 		}
 		assert.ok(url.pathname.endsWith("/api-call"));
-		const auth = JSON.parse(options.body).authIndex;
+		const request = JSON.parse(options.body);
+		if (request.url.includes("cedar_ember=")) return Response.json({ status_code: 200, body: JSON.stringify({ cedar_ember: { eligible: false, grants: [] } }) });
+		if (request.url.endsWith("/rate-limit-reset-credits")) return Response.json({ status_code: 200, body: JSON.stringify({ available_count: 0, credits: [] }) });
+		const auth = request.authIndex;
 		h.usage.set(auth, (h.usage.get(auth) ?? 0) + 1);
 		h.current++;
 		h.peak = Math.max(h.peak, h.current);

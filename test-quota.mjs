@@ -33,7 +33,7 @@ const wins = [
 	{ label: "5-hour (session)", remainingPct: 64, resetIso: "2026-08-19T11:50:00Z" },
 	{ label: "7-day (weekly)", remainingPct: 95, resetIso: "2026-08-25T03:00:00Z" },
 ];
-const expectedFooter = "Quota 5h ━━━━── 64% ↻2h50m · 7d ━━━━━━ 95% ↻5d18h";
+const expectedFooter = "5h ━━━━── 64% ↻2h50m · 7d ━━━━━━ 95% ↻5d18h";
 console.assert(summaryFromWins(wins, now) === expectedFooter, "plain footer");
 console.assert(summaryFromWins([...wins].reverse(), now) === expectedFooter, "5h then weekly footer order");
 console.assert(renderWindows(wins, now)[0].includes("36% used · 64% left"), "render used/left");
@@ -45,12 +45,12 @@ const themedWarning = summaryFromWins([{ label: "5h", remainingPct: 30, resetIso
 console.assert(themedWarning.includes("<warning>━━</warning><dim>────</dim> <warning>30%</warning>"), "warning footer tone");
 const themedCritical = summaryFromWins([{ label: "5h", remainingPct: 10, resetIso: null }], now, mockTheme);
 console.assert(themedCritical.includes("<error>━</error><dim>─────</dim> <error>10%</error>"), "critical footer tone");
-console.assert(summaryFromWins([{ label: "unknown", remainingPct: null, resetIso: null }], now) === "Quota n/a", "null footer window");
+console.assert(summaryFromWins([{ label: "unknown", remainingPct: null, resetIso: null }], now) === "n/a", "null footer window");
 console.assert(
 	summaryFromWins([...wins, { label: "1h", remainingPct: 50, resetIso: null }], now).includes("1h") === false,
 	"footer only shows two windows",
 );
-console.assert(summaryFromWins([{ label: "5h", remainingPct: 125, resetIso: "2026-08-19T14:00:00Z" }], now) === "Quota 5h ━━━━━━ 100%", "clamped footer quota");
+console.assert(summaryFromWins([{ label: "5h", remainingPct: 125, resetIso: "2026-08-19T14:00:00Z" }], now) === "5h ━━━━━━ 100%", "clamped footer quota");
 // Routing comes from credentials' registered IDs, never model family/provider-name guesses.
 const routes = [
 	{ credential: { id: "c1", name: "c1.json", provider: "claude", auth_index: "1111111111111111" }, modelIds: ["claude-opus-5.5", "claude-sonnet-4-6", "friendly-alias"] },
@@ -80,10 +80,10 @@ assert.deepEqual(resolveModelAuth("friendly-alias", sameProvider), { kind: "ambi
 const snapshot = { base: "http://proxy", routes: sameProvider, windows: new Map([
 	["1111111111111111", wins], ["5555555555555555", [{ label: "5h", remainingPct: 12, resetIso: null }]],
 ]) };
-assert.equal(quotaFooter(snapshot, "friendly-alias", null, now), "Quota[claude] auth pending (2 accounts)");
-assert.ok(quotaFooter(snapshot, "friendly-alias", "5555555555555555", now).startsWith("Quota[claude:55555555] 5h ━───── 12%"));
-assert.equal(quotaFooter(snapshot, "gpt-5.6-terra", null, now), "Quota[codex] n/a", "never fall back when selected quota is missing");
-assert.equal(quotaFooter(snapshot, "friendly-alias", "deleted-auth", now), "Quota auth unknown");
+assert.equal(quotaFooter(snapshot, "friendly-alias", null, now), "claude auth pending (2 accounts)");
+assert.ok(quotaFooter(snapshot, "friendly-alias", "5555555555555555", now).startsWith("claude:55555555 5h ━───── 12%"));
+assert.equal(quotaFooter(snapshot, "gpt-5.6-terra", null, now), "codex n/a", "never fall back when selected quota is missing");
+assert.equal(quotaFooter(snapshot, "friendly-alias", "deleted-auth", now), "auth unknown");
 
 const trace = "20261008235959-2222222222222222-0199b012-3456-7890-abcd-0123456789ab";
 assert.equal(authIndexFromHeaders({ "X-CPA-TRACE-ID": trace }), "2222222222222222");
@@ -132,7 +132,7 @@ console.assert(kiroLive[0].resetIso === "2026-11-01T00:00:00Z", "kiro live reset
 // renderWindows with Kiro metrics: should display percentage, used/limit, remaining absolute, and reset countdown
 const renderedKiro = renderWindows(kiroLive, now)[0];
 console.assert(renderedKiro.includes("1% used · 99% left (27.1/2000 invocations · 1972.9 left)"), "kiro render detail formatting");
-console.assert(summaryFromWins(kiroLive, now).includes("Quota monthly ━━━━━━ 99%"), "kiro footer compact percentage");
+console.assert(summaryFromWins(kiroLive, now).includes("monthly ━━━━━━ 99%"), "kiro footer compact percentage");
 
 // 2. Exhausted quota (0% remaining fraction)
 const kiroExhausted = parseKiroUsage(JSON.stringify({
@@ -192,19 +192,19 @@ console.assert(kiroMulti[0].label === "monthly credits" && kiroMulti[1].label ==
 const fullWins = [
 	{ label: "5-hour (session)", remainingPct: 100, resetIso: "2026-08-19T14:00:00Z" },
 ];
-console.assert(summaryFromWins(fullWins, now) === "Quota 5h ━━━━━━ 100%", "footer full quota");
+console.assert(summaryFromWins(fullWins, now) === "5h ━━━━━━ 100%", "footer full quota");
 console.assert(renderWindows(fullWins, now)[0].includes("100% left · —"), "render full reset");
 // rounding hole: 99.96% displays as 100% and must also hide the (sliding) countdown
 const nearFull = [
 	{ label: "5-hour (session)", remainingPct: 99.96, resetIso: "2026-08-19T14:00:00Z" },
 ];
-console.assert(summaryFromWins(nearFull, now) === "Quota 5h ━━━━━━ 100%", "footer near-full quota");
+console.assert(summaryFromWins(nearFull, now) === "5h ━━━━━━ 100%", "footer near-full quota");
 
 // tag unit checks (e.g. limit reached)
 const taggedWins = [
 	{ label: "30d", remainingPct: 0, resetIso: "2026-08-26T09:00:00Z", tag: "limit reached" },
 ];
-console.assert(summaryFromWins(taggedWins, now) === "Quota 30d ────── 0% ↻7d0h (limit reached)", "footer tagged");
+console.assert(summaryFromWins(taggedWins, now) === "30d ────── 0% ↻7d0h (limit reached)", "footer tagged");
 console.assert(renderWindows(taggedWins, now)[0].includes("100% used · 0% left · resets in 7d 0h · limit reached"), "render tagged");
 
 // Antigravity multi-group unit checks
@@ -246,7 +246,7 @@ console.assert(
 );
 
 const agFooterClaude = summaryFromWins(agWins, now, undefined, "claude-sonnet-4-6");
-console.assert(agFooterClaude === "Quota 5h ━━━━━━ 100% · 7d ━━━━━━ 100%", "ag claude group footer");
+console.assert(agFooterClaude === "5h ━━━━━━ 100% · 7d ━━━━━━ 100%", "ag claude group footer");
 
 // Deduplication check: even if arbitrary duplicate 5h windows exist without group, 5h is not duplicated
 const dupWins = [
@@ -319,6 +319,7 @@ try {
 			return Response.json({
 				status_code: 200,
 				body: JSON.stringify({
+					cedar_ember: { eligible: false, grants: [] },
 					five_hour: { utilization: 36, resets_at: "2026-08-19T11:50:00Z" },
 					seven_day: { utilization: 5, resets_at: "2026-08-25T03:00:00Z" },
 				}),
@@ -344,18 +345,19 @@ try {
 		throw new Error(`Unexpected mocked request: ${url}`);
 	};
 	const mocked = await collectQuota("http://mock", "test-key", now, null, undefined, "friendly-alias");
-	console.assert(mocked.footer.startsWith("Quota[claude] 5h ━━━━── 64%"), "registry-selected footer");
-	assert.equal((await collectQuota("http://mock", "test-key", now, null, undefined, "unknown")).footer, "Quota auth unknown");
+	console.assert(mocked.footer.startsWith("claude 5h ━━━━── 64%"), "registry-selected footer");
+	assert.equal((await collectQuota("http://mock", "test-key", now, null, undefined, "unknown")).footer, "auth unknown");
 	console.assert(mocked.blocks[0] === "● user@example.com [claude]", "mocked credential rendering");
-	console.assert(mocked.blocks[3] === "● Kiro Account [kiro]", "mocked kiro credential rendering");
-	console.assert(mocked.blocks[4].includes("monthly credits"), "mocked kiro window rendering");
-	console.assert(mocked.blocks[4].includes("27.1/2000 invocations"), "mocked kiro detail rendering");
+	const kiroHeading = mocked.blocks.indexOf("● Kiro Account [kiro]");
+	console.assert(kiroHeading > 0, "mocked kiro credential rendering");
+	console.assert(mocked.blocks[kiroHeading + 1].includes("monthly credits"), "mocked kiro window rendering");
+	console.assert(mocked.blocks[kiroHeading + 1].includes("27.1/2000 invocations"), "mocked kiro detail rendering");
 
 	const mockedKiro = await collectQuota("http://mock", "test-key", now, null, undefined, "kiro/auto");
-	console.assert(mockedKiro.footer.startsWith("Quota[kiro] monthly ━━━━━━ 99%"), "kiro model selection footer");
+	console.assert(mockedKiro.footer.startsWith("kiro monthly ━━━━━━ 99%"), "kiro model selection footer");
 
 	const themedMocked = await collectQuota("http://mock", "test-key", now, "claude-1", mockTheme);
-	console.assert(themedMocked.footer.startsWith("Quota[claude] <dim>5h </dim>"), "theme forwarded through quota collection");
+	console.assert(themedMocked.footer.startsWith("claude <dim>5h </dim>"), "theme forwarded through quota collection");
 } finally {
 	globalThis.fetch = originalFetch;
 }

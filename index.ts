@@ -93,6 +93,7 @@ export interface AuthFile {
 	email?: string;
 	label?: string;
 	project_id?: string;
+	account_id?: string;
 }
 
 type ResponseHeaders = Record<string, string | string[]>;
@@ -218,9 +219,68 @@ async function proxyCall(
 
 const BEARER = { Authorization: "Bearer $TOKEN$" };
 
+export interface ManualResets {
+	availableCount: number | null;
+	expiries: Array<{ expiresAt: string | null; count: number }>;
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? value as Record<string, unknown> : undefined;
+}
+
+function resetCount(value: unknown): number | null {
+	if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return null;
+	const n = toNum(value);
+	return n !== null && Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
+function resetExpiry(value: unknown): string | null {
+	return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : null;
+}
+
+/** Read-only Claude banked grants; never claim/spend a reset. */
+export function parseClaudeManualResets(body: string): ManualResets {
+	const program = record(record(JSON.parse(body))?.cedar_ember);
+	if (!program || typeof program.eligible !== "boolean" || (program.grants !== undefined && !Array.isArray(program.grants))) {
+		throw new Error("Invalid Claude manual reset response");
+	}
+	const expiries: ManualResets["expiries"] = [];
+	let availableCount = 0;
+	for (const value of (program.grants as unknown[] | undefined) ?? []) {
+		const grant = record(value);
+		const left = resetCount(grant?.resets_left);
+		const total = resetCount(grant?.resets_total);
+		if (left === null || total === null || left > total) throw new Error("Invalid Claude manual reset grant");
+		availableCount += left;
+		if (left > 0) expiries.push({ expiresAt: resetExpiry(grant?.ends_at), count: left });
+	}
+	return { availableCount, expiries };
+}
+
+/** Only available Codex rate-limit reset credits, not consumed/other credit types. */
+export function parseCodexManualResets(body: string): ManualResets {
+	const data = record(JSON.parse(body));
+	if (!data || !["credits", "available_count", "availableCount", "applicable_available_count", "applicableAvailableCount"].some((key) => key in data) ||
+		(data.credits !== undefined && !Array.isArray(data.credits))) {
+		throw new Error("Invalid Codex manual reset response");
+	}
+	const expiries: ManualResets["expiries"] = [];
+	for (const value of (data.credits as unknown[] | undefined) ?? []) {
+		const credit = record(value);
+		if (!credit || (credit.reset_type ?? credit.resetType) !== "codex_rate_limits" || credit.status !== "available") continue;
+		expiries.push({ expiresAt: resetExpiry(credit.expires_at ?? credit.expiresAt), count: 1 });
+	}
+	return {
+		availableCount: resetCount(data.available_count ?? data.availableCount) ?? (Array.isArray(data.credits) ? expiries.length : null),
+		expiries,
+	};
+}
+
 interface Adapter {
 	verified: boolean;
 	fetch: (base: string, key: string, cred: AuthFile, signal?: AbortSignal) => Promise<Win[]>;
+	fetchManualResets?: (base: string, key: string, cred: AuthFile, signal?: AbortSignal) => Promise<ManualResets>;
 }
 
 // ---- claude (VERIFIED): GET api.anthropic.com/api/oauth/usage ----
@@ -235,6 +295,13 @@ const CLAUDE_WINDOWS: Array<[string, string]> = [
 ];
 const claudeAdapter: Adapter = {
 	verified: true,
+	async fetchManualResets(base, key, cred, signal) {
+		return parseClaudeManualResets(await proxyCall(base, key, {
+			authIndex: cred.auth_index as string, method: "GET",
+			url: "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1",
+			header: { ...BEARER, "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/2.1.280 (external, cli)" },
+		}, signal));
+	},
 	async fetch(base, key, cred, signal) {
 		const authIndex = cred.auth_index as string;
 		const body = await proxyCall(base, key, {
@@ -475,6 +542,18 @@ export function parseCodexUsage(body: string, now = Date.now()): Win[] {
 
 const codexAdapter: Adapter = {
 	verified: true,
+	async fetchManualResets(base, key, cred, signal) {
+		return parseCodexManualResets(await proxyCall(base, key, {
+			authIndex: cred.auth_index as string, method: "GET",
+			url: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+			header: {
+				...BEARER, "Content-Type": "application/json", Accept: "application/json",
+				"User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+				"OpenAI-Beta": "codex-1", Originator: "Codex Desktop",
+				...(cred.account_id ? { "Chatgpt-Account-Id": cred.account_id } : {}),
+			},
+		}, signal));
+	},
 	async fetch(base, key, cred, signal) {
 		const authIndex = cred.auth_index as string;
 		const body = await proxyCall(base, key, {
@@ -616,6 +695,7 @@ export interface QuotaStatus {
 	error?: string;
 	retryAt?: number;
 	rateLimited?: boolean;
+	manualResetsError?: string;
 	stale: boolean;
 }
 
@@ -623,6 +703,7 @@ export interface QuotaSnapshot {
 	base: string;
 	routes: CredentialModels[];
 	windows: Map<string, Win[]>; // auth_index -> windows, never merged by provider
+	manualResets?: Map<string, ManualResets>;
 	statuses?: Map<string, QuotaStatus>;
 }
 
@@ -695,9 +776,9 @@ export function resolveModelAuth(model: ModelHint, routes: CredentialModels[], s
 
 export function quotaFooter(snapshot: QuotaSnapshot, model: ModelHint, selectedAuthIndex?: string | null, now = Date.now(), theme?: FooterTheme): string {
 	const resolved = resolveModelAuth(model, snapshot.routes, selectedAuthIndex);
-	if (resolved.kind === "unknown") return resolved.reason === "registry" ? "Quota routing unavailable" : "Quota auth unknown";
+	if (resolved.kind === "unknown") return resolved.reason === "registry" ? "routing unavailable" : "auth unknown";
 	if (resolved.kind === "ambiguous") {
-		return `Quota[${resolved.providers.join("/")}] auth pending (${resolved.count} accounts)`;
+		return `${resolved.providers.join("/")} auth pending (${resolved.count} accounts)`;
 	}
 	const cred = resolved.credential;
 	const pk = providerKey(cred);
@@ -706,7 +787,7 @@ export function quotaFooter(snapshot: QuotaSnapshot, model: ModelHint, selectedA
 	const summary = summaryFromWins(snapshot.windows.get(cred.auth_index as string) ?? [], now, theme, model);
 	const status = snapshot.statuses?.get(cred.auth_index as string);
 	const note = status?.error ? ` · ${status.stale ? "stale; " : ""}${status.rateLimited ? "rate limited" : "refresh failed"}${status.retryAt ? compactReset(new Date(status.retryAt).toISOString(), now) : ""}` : "";
-	return summary.replace(/^Quota /, `Quota[${label}] `) + note;
+	return `${label} ${summary}${note}`;
 }
 
 const QUOTA_TTL_MS = 5 * 60_000;
@@ -716,6 +797,8 @@ const MAX_BACKOFF_MS = 60 * 60_000;
 interface Flight<T> { controller: AbortController; promise: Promise<T>; users: number }
 interface AccountCache {
 	windows?: Win[];
+	manualResets?: ManualResets;
+	manualResetsError?: string;
 	checkedAt?: number;
 	retryAt: number;
 	failures: number;
@@ -795,7 +878,7 @@ export function createQuotaClient(
 		const managementBlocked = cache.managementUntil > clock();
 		const error = managementBlocked ? cache.managementError?.message : entry?.error;
 		return {
-			checkedAt: entry?.checkedAt, error,
+			checkedAt: entry?.checkedAt, error, manualResetsError: entry?.manualResetsError,
 			nextFetchAt: Math.max(entry?.retryAt ?? 0, cache.managementUntil) || undefined,
 			rateLimited: managementBlocked || entry?.rateLimited,
 			retryAt: error ? Math.max(entry?.retryAt ?? 0, managementBlocked ? cache.managementUntil : 0) : undefined,
@@ -849,14 +932,16 @@ export function createQuotaClient(
 		// Never publish an older credential list over a newer registry result.
 		routes = cache.routes ?? routes;
 		const windows = new Map<string, Win[]>();
+		const manualResets = new Map<string, ManualResets>();
 		const statuses = new Map<string, QuotaStatus>();
 		for (const { credential } of routes) {
 			const index = credential.auth_index as string;
 			const entry = cache.accounts.get(index);
 			if (entry?.windows) windows.set(index, entry.windows);
+			if (entry?.manualResets) manualResets.set(index, entry.manualResets);
 			statuses.set(index, accountStatus(cache, entry));
 		}
-		return { base: base.replace(/\/$/, ""), routes, windows, statuses };
+		return { base: base.replace(/\/$/, ""), routes, windows, manualResets, statuses };
 	}
 
 	async function quota(base: string, key: string, cred: AuthFile, signal?: AbortSignal): Promise<void> {
@@ -880,6 +965,21 @@ export function createQuotaClient(
 				account.windows = wins;
 				account.checkedAt = clock();
 				// Keep admission-based spacing; completion latency must not add another TTL.
+				const fetchResets = ADAPTERS[providerKey(cred)].fetchManualResets;
+				if (fetchResets) {
+					try {
+						controller.signal.throwIfAborted();
+						const resets = await fetchResets(base, key, cred, controller.signal);
+						controller.signal.throwIfAborted();
+						account.manualResets = resets;
+						account.manualResetsError = undefined;
+					} catch (err) {
+						account.manualResetsError = controller.signal.aborted ? "refresh interrupted" : (err as Error).message;
+						// Optional metadata failures must not discard successful quota windows.
+						// 429s still enter the normal per-auth/proxy cooldown path below.
+						if (controller.signal.aborted || (err as QuotaHttpError).status === 429) throw err;
+					}
+				}
 				account.failures = 0;
 				account.error = undefined;
 				account.rateLimited = false;
@@ -925,6 +1025,16 @@ export function createQuotaClient(
 			const heading = `● ${cred.email || cred.label || cred.name} [${pk}]${ADAPTERS[pk].verified ? "" : " (unverified)"}`;
 			blocks.push(heading + (status?.stale ? " (cached, stale)" : ""));
 			if (wins) blocks.push(...renderWindows(wins, now));
+			const resets = result.manualResets?.get(index);
+			if (resets) blocks.push(...renderManualResets(resets, now, Boolean(status?.stale || status?.manualResetsError)));
+			else if (ADAPTERS[pk].fetchManualResets && !status?.manualResetsError) {
+				// Reload can inherit quota-only cache entries from an older extension.
+				// Show the missing metadata explicitly; never bypass admission/cooldown to fill it.
+				const refreshAt = status?.nextFetchAt;
+				const wait = refreshAt && refreshAt > now ? ` · ${formatReset(new Date(refreshAt).toISOString(), now).replace("resets", "refresh")}` : "";
+				blocks.push(`  Manual resets: n/a (pending refresh)${wait}`);
+			}
+			if (status?.manualResetsError) blocks.push(`  Manual resets unavailable: ${status.manualResetsError}`);
 			if (status?.error) blocks.push(`  failed: ${status.error}${status.retryAt ? ` · ${formatReset(new Date(status.retryAt).toISOString(), now).replace("resets", "retry")}` : ""}`);
 			else if (!wins) blocks.push("  (quota refresh pending)");
 		}
@@ -991,6 +1101,28 @@ export function renderWindows(wins: Win[], now = Date.now()): string[] {
 				: "";
 		return `  ${w.label.padEnd(22)} ${bar(used)} ${used.toFixed(0)}% used · ${remain.toFixed(0)}% left${detailStr} · ${resetStr}${tagStr}`;
 	});
+}
+
+/** Manual reset expiry is always GMT+7, independent of the machine's timezone. */
+export function renderManualResets(resets: ManualResets, now = Date.now(), stale = false): string[] {
+	const lines = [`  Manual resets: ${resets.availableCount ?? "n/a"}${stale ? " (cached, stale)" : ""}`];
+	if (!resets.expiries.length) return lines;
+	lines.push("  Manual reset expiry (GMT+7)");
+	const sorted = [...resets.expiries].sort((a, b) => (a.expiresAt ? Date.parse(a.expiresAt) : Infinity) - (b.expiresAt ? Date.parse(b.expiresAt) : Infinity));
+	for (const [index, expiry] of sorted.entries()) {
+		let when = "Expiry unknown";
+		if (expiry.expiresAt) {
+			const t = Date.parse(expiry.expiresAt);
+			if (Number.isFinite(t)) {
+				const local = new Date(t + 7 * 3_600_000).toISOString();
+				const days = Math.floor((t - now) / 86_400_000);
+				const relative = t <= now ? "expired" : days >= 1 ? `in ${days} day${days === 1 ? "" : "s"}` : formatReset(expiry.expiresAt, now).replace("resets ", "");
+				when = `${local.slice(5, 10).replace("-", "/")}, ${local.slice(11, 16)} · ${relative}`;
+			}
+		}
+		lines.push(`    Reset ${index + 1}${expiry.count > 1 ? ` (${expiry.count} resets)` : ""}  ${when}`);
+	}
+	return lines;
 }
 
 function shortTag(label: string): string {
@@ -1129,7 +1261,127 @@ export function summaryFromWins(
 		const styledTag = theme && tagStr ? theme.fg("dim", tagStr) : tagStr;
 		parts.push(`${styledLabel}${compactMeter(remaining, theme)} ${styledValue}${styledReset}${styledTag}`);
 	}
-	return parts.length ? `Quota ${parts.join(theme ? theme.fg("dim", " · ") : " · ")}` : "Quota n/a";
+	return parts.length ? parts.join(theme ? theme.fg("dim", " · ") : " · ") : "n/a";
+}
+
+// ---------- footer line ----------
+
+interface LineComponent {
+	render(width: number): string[];
+	invalidate?(): void;
+}
+
+/** Marks our wrapper so a re-install reuses the built-in footer it wraps. */
+const WRAPPED_FOOTER = Symbol.for("pi-cliproxyapi-quota.wrapped-footer");
+const ANSI_SEQUENCE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/y;
+
+/** Truncate an ANSI-styled single line to `width` visible cells (one cell per code point). */
+export function truncateStyled(text: string, width: number): string {
+	const tokens: Array<{ ansi: boolean; text: string }> = [];
+	let visible = 0;
+	for (let i = 0; i < text.length;) {
+		ANSI_SEQUENCE.lastIndex = i;
+		const match = ANSI_SEQUENCE.exec(text);
+		if (match) {
+			tokens.push({ ansi: true, text: match[0] });
+			i += match[0].length;
+			continue;
+		}
+		const ch = String.fromCodePoint(text.codePointAt(i) as number);
+		tokens.push({ ansi: false, text: ch });
+		visible++;
+		i += ch.length;
+	}
+	if (visible <= width) return text;
+	if (width <= 0) return "";
+	let out = "";
+	let used = 0;
+	for (const token of tokens) {
+		if (token.ansi) out += token.text;
+		else if (used < width - 1) {
+			out += token.text;
+			used++;
+		}
+	}
+	return `${out}\x1b[0m…`;
+}
+
+/** Locate pi's built-in footer component (duck-typed; pi does not expose it to extensions). */
+function findBuiltinFooter(tui: unknown): LineComponent | undefined {
+	const children = (tui as { children?: unknown })?.children;
+	if (!Array.isArray(children)) return undefined;
+	for (let i = children.length - 1; i >= 0; i--) {
+		const kids = (children[i] as { children?: unknown })?.children;
+		if (!Array.isArray(kids) || kids.length !== 1) continue;
+		const child = kids[0] as Record<string | symbol, unknown>;
+		if (child?.[WRAPPED_FOOTER]) return child[WRAPPED_FOOTER] as LineComponent;
+		if (typeof child?.render === "function" && typeof child.setAutoCompactEnabled === "function" && typeof child.setSession === "function") {
+			return child as unknown as LineComponent;
+		}
+	}
+	return undefined;
+}
+
+interface FooterLine {
+	/** Show/hide the quota line. Returns false once the footer was replaced by someone else. */
+	set(text: string | undefined): boolean;
+	dispose(): void;
+}
+
+/**
+ * Keep pi's default footer untouched and render the quota as its own line directly below the
+ * default pwd/stats lines (above other extensions' status line). Returns undefined when the
+ * built-in footer cannot be found (e.g. another extension already replaced it).
+ */
+function installFooterLine(ui: ExtensionContext["ui"]): FooterLine | undefined {
+	if (typeof ui.setFooter !== "function" || typeof ui.setWidget !== "function") return undefined;
+	let tui: { requestRender?(): void } | undefined;
+	const probe = "cliproxy-quota-probe";
+	try {
+		ui.setWidget(probe, (t) => {
+			tui = t;
+			return { render: () => [], invalidate() {} };
+		}, { placement: "belowEditor" });
+	} finally {
+		ui.setWidget(probe, undefined);
+	}
+	const builtin = findBuiltinFooter(tui);
+	if (!builtin) return undefined;
+	let line: string | undefined;
+	let installed = true;
+	ui.setFooter((t) => {
+		tui = t;
+		return {
+			[WRAPPED_FOOTER]: builtin,
+			render(width: number): string[] {
+				const lines = builtin.render(width);
+				if (line === undefined) return lines;
+				// Built-in footer: [pwd, stats, ...extension statuses]; quota goes right after stats.
+				const at = Math.min(2, lines.length);
+				return [...lines.slice(0, at), truncateStyled(line, width), ...lines.slice(at)];
+			},
+			invalidate() {
+				builtin.invalidate?.();
+			},
+			dispose() {
+				installed = false; // Replaced by another footer or restored by pi.
+			},
+		};
+	});
+	return {
+		set(text) {
+			if (!installed) return false;
+			if (text !== line) {
+				line = text;
+				tui?.requestRender?.();
+			}
+			return true;
+		},
+		dispose() {
+			if (installed) ui.setFooter(undefined);
+			installed = false;
+		},
+	};
 }
 
 // ---------- extension ----------
@@ -1154,6 +1406,8 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 	let selectedAuthIndex: string | null = null;
 	let requestRun: { revision: number; modelKey: string; scope: string } | undefined;
 	let pendingRequest: typeof requestRun;
+	let footerLine: FooterLine | undefined;
+	let statusShown = false;
 
 	const modelKey = (model: ProxyModel | undefined) => JSON.stringify([model?.provider, model?.id, model?.baseUrl]);
 	const currentScope = () => scopeId(resolveBaseUrl(), resolveManagementKey() ?? "");
@@ -1175,16 +1429,28 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 		return { base, key, scope };
 	}
 
+	function showFooter(ctx: ExtensionContext, text: string | undefined): void {
+		if (footerLine?.set(text)) {
+			if (statusShown) ctx.ui.setStatus(QUOTA_KEY, undefined);
+			statusShown = false;
+			return;
+		}
+		// Fallback: shared extension status line (no built-in footer to extend).
+		footerLine = undefined;
+		ctx.ui.setStatus(QUOTA_KEY, text);
+		statusShown = text !== undefined;
+	}
+
 	function updateFooter(ctx: ExtensionContext): void {
 		if (!isPrimaryUiSession(ctx)) return;
 		if (!isProxyModel(ctx.model, resolveBaseUrl())) {
-			ctx.ui.setStatus(QUOTA_KEY, undefined);
+			showFooter(ctx, undefined);
 			return;
 		}
 		const footer = snapshot && snapshotScope === currentScope()
 			? quotaFooter(snapshot, ctx.model, selectedAuthIndex, Date.now(), ctx.ui.theme)
-			: "Quota routing unavailable";
-		ctx.ui.setStatus(QUOTA_KEY, ctx.ui.theme.fg("dim", footer));
+			: "routing unavailable";
+		showFooter(ctx, ctx.ui.theme.fg("dim", footer));
 	}
 
 	async function refreshRouting(ctx: ExtensionContext, refresh = false): Promise<void> {
@@ -1304,12 +1570,24 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 	pi.on("session_start", (_e, ctx) => {
 		resetSession();
 		active = true;
+		footerLine?.dispose();
+		footerLine = undefined;
+		if (isPrimaryUiSession(ctx)) {
+			try {
+				footerLine = installFooterLine(ctx.ui);
+			} catch {
+				footerLine = undefined; // Fall back to setStatus.
+			}
+		}
 		schedule(ctx, true);
 	});
 	pi.on("session_shutdown", (_e, ctx) => {
 		active = false;
 		resetSession();
 		activeCtx = undefined;
+		footerLine?.dispose();
+		footerLine = undefined;
+		statusShown = false;
 		if (isPrimaryUiSession(ctx)) ctx.ui.setStatus(QUOTA_KEY, undefined);
 	});
 

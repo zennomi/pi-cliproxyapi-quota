@@ -22,19 +22,21 @@ Kiro subscriptions expose monthly credits rather than 5h/weekly windows. `/quota
 
 | Trigger | What it does |
 |---|---|
-| `/quota` | Show every account's quota windows: used %, remaining %, reset countdown. Reuses the five-minute cache and respects rate-limit cooldowns. |
+| `/quota` | Show every account's quota windows: used %, remaining %, reset countdown. Claude and Codex also show manual reset counts and expiry dates (GMT+7), with relative countdowns. Reuses the five-minute cache and respects rate-limit cooldowns. |
 | `Ctrl+Shift+Q` | Same as `/quota`, but works **while the model is streaming** (it's a shortcut, not a queued command). |
-| footer `Quota[claude] 5h ━━━━── 64% · 7d ━━━━━━ 95%` | Compact 6-cell **remaining** quota meters for the **current model's credential**, resolved from the live model registry and response trace headers. Ambiguous routes show `auth pending` instead of another account's quota. Filled meters and percentages are green when healthy, yellow at ≤30% left, and red at ≤10%; empty cells, separators, and reset times are dim. Rendered on session load and model switches; upstream quota refreshes every 5 minutes, even while idle, subject to cache/cooldown. |
+| footer `claude 5h ━━━━── 64% · 7d ━━━━━━ 95%` | Compact 6-cell **remaining** quota meters for the **current model's credential**, resolved from the live model registry and response trace headers. Ambiguous routes show `auth pending` instead of another account's quota. Filled meters and percentages are green when healthy, yellow at ≤30% left, and red at ≤10%; empty cells, separators, and reset times are dim. Shown on its own line directly below pi's default footer lines (the default footer is left untouched; falls back to the shared status line if another extension replaced the footer). Rendered on session load and model switches; upstream quota refreshes every 5 minutes, even while idle, subject to cache/cooldown. |
 
 The quota data path mirrors the EasyCLIProxyAPI control panel exactly: the proxy management API
 `POST /v0/management/api-call` proxies each provider's own usage endpoint (e.g. Anthropic
 `/api/oauth/usage`, Google `retrieveUserQuotaSummary`) using the stored OAuth credential. These
 endpoints report utilization; they do not consume quota. Disabled credentials are skipped.
 
+Manual resets are read-only: Claude reads banked grants from `/api/oauth/usage?cedar_ember=1&skip_spend=1`; Codex reads `/backend-api/wham/rate-limit-reset-credits`. These follow the same per-account cache, single-flight, cancellation, and 429 cooldown as quota windows. Expiries are sorted earliest first; Claude grants containing multiple resets show their count. A reset-data failure preserves quota windows and marks cached reset data stale. No reset is consumed. After upgrading with `/reload`, a pre-existing quota-only cache shows `Manual resets: n/a (pending refresh)` until the next permitted refresh; upgrading never bypasses the five-minute interval or an active 429 cooldown. Manual reset parsing is based on the management panel; live verification is pending.
+
 ### Dynamic model and account routing
 
 - The extension reads `GET /v0/management/auth-files` and `GET /v0/management/auth-files/models?name=…` to match the current model against each credential's registered IDs, including aliases and prefixes. Model names and pi provider labels are not used to guess the upstream provider.
-- With one matching credential, its quota is shown immediately. With multiple matches (even within one provider), the footer shows e.g. `Quota[claude/antigravity] auth pending (2 accounts)` until a response identifies the account.
+- With one matching credential, its quota is shown immediately. With multiple matches (even within one provider), the footer shows e.g. `claude/antigravity auth pending (2 accounts)` until a response identifies the account.
 - Pi's `after_provider_response` event supplies `X-CPA-TRACE-ID` (`timestamp-auth_index-request_id`). The extension uses that index to select the exact account's cached quota without delaying stream consumption. Multiple accounts of one provider are distinguished by a short auth index in the footer.
 - This describes the last safely attributed conversational request, not a permanent account pin: each new request can choose another account. Idle cache-warming callbacks are ignored and do not erase that selection. Selection is cleared for new requests, model changes, and session changes. If the model changes during a run, trace attribution is conservatively skipped until the next run so a delayed old request cannot be assigned to the new model. Quota/model data is cached only in memory and refreshed every five minutes.
 - Only models whose `baseUrl` matches the configured proxy receive an automatic quota footer. `/quota` still lists all supported accounts when using a direct provider.
@@ -117,7 +119,7 @@ Kiro 订阅使用按月额度（不分 5h/7d 窗口）。`/quota` 显示百分�
 |---|---|
 | `/quota` | 对代理持有的每个凭证，显示其所有配额窗口：已用 %、剩余 %、重置倒计时。 |
 | `Ctrl+Shift+Q` | 同 `/quota`，但**模型正在输出时也能按**（快捷键，不会被排队）。 |
-| footer `Quota[claude] 5h ━━━━── 64% · 7d ━━━━━━ 95%` | 显示**当前模型**对应服务的 6 格紧凑**剩余额度**条（通过实时模型注册表与响应 trace 识别凭证；多个候选时显示 `auth pending`，不回退到任意账号）。填充条和百分比：剩余 >30% 为绿色、≤30% 为黄色、≤10% 为红色；空格、分隔符和重置时间为暗色。会话加载及模型切换时刷新，此后每 5 分钟自动刷新（空闲时也会刷新）。 |
+| footer `claude 5h ━━━━── 64% · 7d ━━━━━━ 95%` | 显示**当前模型**对应服务的 6 格紧凑**剩余额度**条（通过实时模型注册表与响应 trace 识别凭证；多个候选时显示 `auth pending`，不回退到任意账号）。填充条和百分比：剩余 >30% 为绿色、≤30% 为黄色、≤10% 为红色；空格、分隔符和重置时间为暗色。显示在 pi 默认 footer 下方的独立一行（不修改默认 footer；若 footer 已被其他扩展替换则回退到共享状态行）。会话加载及模型切换时刷新，此后每 5 分钟自动刷新（空闲时也会刷新）。 |
 
 取数链路与 EasyCLIProxyAPI 控制面板完全一致：代理管理 API `POST /v0/management/api-call`
 用存储的 OAuth 凭证代理请求各提供方自己的用量端点（如 Anthropic `/api/oauth/usage`、
