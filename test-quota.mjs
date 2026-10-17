@@ -7,6 +7,7 @@ import {
 	resolveBaseUrl,
 	resolveManagementKey,
 	collectQuota,
+	createQuotaClient,
 	renderWindows,
 	summaryFromWins,
 	formatReset,
@@ -300,6 +301,7 @@ console.assert(codexLegacy[0].label === "5h" && codexLegacy[0].remainingPct === 
 console.assert(codexLegacy[1].label === "weekly" && codexLegacy[1].remainingPct === 80, "codex legacy weekly");
 
 const originalFetch = globalThis.fetch;
+const offlineOptions = { client: createQuotaClient({ cacheDir: false }) };
 try {
 	globalThis.fetch = async (input) => {
 		const url = String(input);
@@ -344,19 +346,19 @@ try {
 		}
 		throw new Error(`Unexpected mocked request: ${url}`);
 	};
-	const mocked = await collectQuota("http://mock", "test-key", now, null, undefined, "friendly-alias");
+	const mocked = await collectQuota("http://mock", "test-key", now, null, undefined, "friendly-alias", offlineOptions);
 	console.assert(mocked.footer.startsWith("claude 5h ━━━━── 64%"), "registry-selected footer");
-	assert.equal((await collectQuota("http://mock", "test-key", now, null, undefined, "unknown")).footer, "auth unknown");
+	assert.equal((await collectQuota("http://mock", "test-key", now, null, undefined, "unknown", offlineOptions)).footer, "auth unknown");
 	console.assert(mocked.blocks[0] === "● user@example.com [claude]", "mocked credential rendering");
 	const kiroHeading = mocked.blocks.indexOf("● Kiro Account [kiro]");
 	console.assert(kiroHeading > 0, "mocked kiro credential rendering");
 	console.assert(mocked.blocks[kiroHeading + 1].includes("monthly credits"), "mocked kiro window rendering");
 	console.assert(mocked.blocks[kiroHeading + 1].includes("27.1/2000 invocations"), "mocked kiro detail rendering");
 
-	const mockedKiro = await collectQuota("http://mock", "test-key", now, null, undefined, "kiro/auto");
+	const mockedKiro = await collectQuota("http://mock", "test-key", now, null, undefined, "kiro/auto", offlineOptions);
 	console.assert(mockedKiro.footer.startsWith("kiro monthly ━━━━━━ 99%"), "kiro model selection footer");
 
-	const themedMocked = await collectQuota("http://mock", "test-key", now, "claude-1", mockTheme);
+	const themedMocked = await collectQuota("http://mock", "test-key", now, "claude-1", mockTheme, undefined, offlineOptions);
 	console.assert(themedMocked.footer.startsWith("claude <dim>5h </dim>"), "theme forwarded through quota collection");
 } finally {
 	globalThis.fetch = originalFetch;

@@ -2,7 +2,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { setImmediate } from "node:timers/promises";
-import { collectQuota, createQuotaClient, quotaFooter, retryAfterMs } from "./index.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const agentDir = mkdtempSync(join(tmpdir(), "quota-rate-test-"));
+process.env.PI_AGENT_DIR = agentDir;
+process.once("exit", () => rmSync(agentDir, { recursive: true, force: true }));
+const { collectQuota, createQuotaClient, quotaFooter, retryAfterMs } = await import("./index.ts");
 
 const TTL = 300_000;
 const C = "1111111111111111";
@@ -18,7 +24,7 @@ const deferred = () => {
 function setup(t, two = false) {
 	let now = Date.parse("2026-10-08T12:00:00Z");
 	const h = {
-		client: createQuotaClient({ now: () => now, random: () => 0 }),
+		client: createQuotaClient({ cacheDir: false, now: () => now, random: () => 0 }),
 		list: 0, models: 0, usage: new Map(), peak: 0, current: 0,
 		files: [{ id: "c", name: "claude.json", provider: "claude", auth_index: C }],
 		mode: "success", retryAfter: undefined, retryAfterByAuth: new Map(), listMode: "success", quotaGate: undefined, quotaGates: new Map(), listGate: undefined,
@@ -311,8 +317,8 @@ test("management credentials and proxy URLs have isolated caches", async (t) => 
 test("shared process state preserves cache across client instances and module reloads", async (t) => {
 	const h = setup(t);
 	const shared = new Map();
-	const a = createQuotaClient({ now: () => h.now }, shared);
-	const b = createQuotaClient({ now: () => h.now }, shared);
+	const a = createQuotaClient({ cacheDir: false, now: () => h.now }, shared);
+	const b = createQuotaClient({ cacheDir: false, now: () => h.now }, shared);
 	await Promise.all([a.collect(BASE, KEY), b.collect(BASE, KEY)]);
 	assert.equal(h.usage.get(C), 1);
 	await collectQuota("http://mock-reload-cache", KEY);
@@ -335,7 +341,7 @@ test("429 cooldown also survives a module reload in the same process", async (t)
 
 test("jitter never shortens minimum spacing or exceeds the fallback cap", async (t) => {
 	const h = setup(t);
-	h.client = createQuotaClient({ now: () => h.now, random: () => 1 });
+	h.client = createQuotaClient({ cacheDir: false, now: () => h.now, random: () => 1 });
 	h.mode = "429";
 	for (const delay of [6, 12, 24, 48, 60, 60]) {
 		const result = await h.collect();

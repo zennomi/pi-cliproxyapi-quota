@@ -12,10 +12,11 @@
  * ~/.pi/agent/cliproxyapi-quota.json, or the GUI config.toml. See AGENTS.md.
  */
 
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, hostname } from "node:os";
+import { dirname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ---------- config resolution ----------
@@ -696,12 +697,14 @@ export interface QuotaStatus {
 	retryAt?: number;
 	rateLimited?: boolean;
 	manualResetsError?: string;
+	pendingElsewhere?: boolean;
 	stale: boolean;
 }
 
 export interface QuotaSnapshot {
 	base: string;
 	routes: CredentialModels[];
+	routingPending?: boolean;
 	windows: Map<string, Win[]>; // auth_index -> windows, never merged by provider
 	manualResets?: Map<string, ManualResets>;
 	statuses?: Map<string, QuotaStatus>;
@@ -796,6 +799,8 @@ const MAX_BACKOFF_MS = 60 * 60_000;
 
 interface Flight<T> { controller: AbortController; promise: Promise<T>; users: number }
 interface AccountCache {
+	owner?: string;
+	fetchingUntil?: number;
 	windows?: Win[];
 	manualResets?: ManualResets;
 	manualResetsError?: string;
@@ -812,6 +817,8 @@ interface ProxyCache {
 	routeAttemptAt: number;
 	routeRetryAt: number;
 	routeError?: Error;
+	routeOwner?: string;
+	routeFetchingUntil?: number;
 	routeFlight?: Flight<CredentialModels[]>;
 	managementUntil: number;
 	managementFailures: number;
@@ -822,6 +829,300 @@ interface ProxyCache {
 function scopeId(base: string, key: string): string {
 	// Isolate credentials without putting the management secret in cache keys or files.
 	return `${base.replace(/\/$/, "")}:${createHash("sha256").update(key).digest("hex")}`;
+}
+
+// Locks protect short, synchronous disk transactions only — never network requests.
+const LOCK_STALE_MS = 10_000;
+const FETCH_LEASE_MS = 60_000;
+const SHARED_POLL_MS = 10_000;
+interface LockOwner { pid: number; host: string; token: string; at: number }
+interface QuotaLock { current(): boolean; release(): void }
+const lockSymbol = Symbol.for("pi-cliproxyapi-quota.locks.v1");
+const lockGlobals = globalThis as typeof globalThis & { [key: symbol]: Map<string, string> | undefined };
+const installLockCleanup = !lockGlobals[lockSymbol];
+const heldLocks = lockGlobals[lockSymbol] ??= new Map<string, string>();
+
+function lockOwner(path: string): LockOwner | undefined {
+	try {
+		const value = JSON.parse(readFileSync(path, "utf8"));
+		return value && Number.isSafeInteger(value.pid) && value.pid > 0 &&
+			typeof value.host === "string" && value.host.length > 0 && typeof value.token === "string" && value.token.length > 0 &&
+			typeof value.at === "number" && Number.isFinite(value.at) ? value as LockOwner : undefined;
+	} catch { return undefined; }
+}
+
+function releaseQuotaLock(path: string, token: string): void {
+	try { if (lockOwner(path)?.token === token) unlinkSync(path); } catch { /* best effort */ }
+	if (heldLocks.get(path) === token) heldLocks.delete(path);
+}
+
+// Register once even across /reload. SIGKILL cannot run this; dead-PID/age recovery handles it.
+if (installLockCleanup) {
+	process.on("exit", function releaseQuotaLocks() {
+		for (const [path, token] of heldLocks) releaseQuotaLock(path, token);
+	});
+}
+
+/** Internal disk lock; exported for offline crash/recovery tests. Undefined means busy, not unlocked. */
+export async function acquireQuotaLock(path: string, signal?: AbortSignal, waitMs = 2000): Promise<QuotaLock | undefined> {
+	const deadline = performance.now() + waitMs;
+	const token = randomUUID();
+	for (;;) {
+		signal?.throwIfAborted();
+		let fd: number;
+		try { fd = openSync(path, "wx", 0o600); }
+		catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+			try {
+				const stat = statSync(path);
+				const owner = lockOwner(path);
+				let dead = false;
+				if (owner?.host === hostname() && Number.isSafeInteger(owner.pid) && owner.pid > 0) {
+					try { process.kill(owner.pid, 0); } catch (e) { dead = (e as NodeJS.ErrnoException).code === "ESRCH"; }
+				}
+				if (dead || Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+					// Recheck identity immediately before moving. Never intentionally delete a replacement lock.
+					const latest = statSync(path);
+					if (latest.ino === stat.ino && latest.mtimeMs === stat.mtimeMs && lockOwner(path)?.token === owner?.token) {
+						const tomb = `${path}.${token}.stale`;
+						renameSync(path, tomb);
+						const moved = statSync(tomb);
+						if (moved.ino !== stat.ino || moved.mtimeMs !== stat.mtimeMs || lockOwner(tomb)?.token !== owner?.token) {
+							// A different process replaced it during recovery. Restore exclusively if possible.
+							try { linkSync(tomb, path); } catch { /* never overwrite a newer owner */ }
+						}
+						unlinkSync(tomb);
+						continue;
+					}
+				}
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+			}
+			if (performance.now() >= deadline) return undefined;
+			await sleep(25, undefined, { signal });
+			continue;
+		}
+		heldLocks.set(path, token);
+		try { writeFileSync(fd, JSON.stringify({ pid: process.pid, host: hostname(), token, at: Date.now() } satisfies LockOwner)); }
+		catch (err) {
+			// Only remove a verifiably owned file. A partial/empty write is recovered by age later.
+			releaseQuotaLock(path, token);
+			throw err;
+		} finally { closeSync(fd); }
+		const current = () => lockOwner(path)?.token === token;
+		if (signal?.aborted) { releaseQuotaLock(path, token); signal.throwIfAborted(); }
+		return { current, release: () => releaseQuotaLock(path, token) };
+	}
+}
+
+interface DiskAccount extends Omit<AccountCache, "flight"> { version: 1 }
+interface DiskRoutes {
+	version: 1;
+	routes?: CredentialModels[];
+	routesAt: number;
+	routeAttemptAt: number;
+	routeRetryAt: number;
+	routeError?: string;
+	routeOwner?: string;
+	routeFetchingUntil?: number;
+}
+interface DiskManagement { version: 1; managementUntil: number; managementFailures: number; managementError?: string }
+const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+const accountFile = (index: string) => `accounts/${/^[a-f\d]{16}$/i.test(index) ? index : digest(index)}`;
+const finiteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const timestamp = (value: unknown): value is number => finiteNumber(value) && value >= 0 && value <= 8.64e15;
+
+// Persist only documented credential metadata, never extra auth-files fields (tokens, raw content, ...).
+function publicRoutes(routes: CredentialModels[]): CredentialModels[] {
+	return routes.map(({ credential: c, modelIds }) => ({ credential: {
+		id: c.id, name: c.name, provider: c.provider, type: c.type, auth_index: c.auth_index,
+		disabled: c.disabled, email: c.email, label: c.label, project_id: c.project_id, account_id: c.account_id,
+	}, modelIds }));
+}
+
+function validRoutes(value: unknown): value is CredentialModels[] {
+	return Array.isArray(value) && value.every((r) => r && typeof r === "object" && r.credential &&
+		typeof r.credential.id === "string" && typeof r.credential.name === "string" && typeof r.credential.auth_index === "string" &&
+		["provider", "type", "email", "label", "project_id", "account_id"].every((field) =>
+			r.credential[field] === undefined || typeof r.credential[field] === "string") &&
+		(r.credential.disabled === undefined || typeof r.credential.disabled === "boolean") &&
+		(r.modelIds === null || (Array.isArray(r.modelIds) && r.modelIds.every((id: unknown) => typeof id === "string"))));
+}
+
+/** Synchronous read/modify/write inside a short lock; all HTTP work is outside transactions. */
+function createSharedStore(root: string | false, clock: () => number) {
+	let disabled = root === false;
+	const pathFor = (scope: string, name: string) => join(root || "", digest(scope), `${name}.json`);
+	const journalDir = (scope: string, name: string) => join(root || "", digest(scope), "leases", digest(name));
+	type DiskState = DiskAccount | DiskRoutes | DiskManagement;
+	const deadline = (value: DiskState | undefined, name: string): number => {
+		const time = name === "routes" ? (value as DiskRoutes)?.routeAttemptAt : name === "management"
+			? (value as DiskManagement)?.managementUntil : (value as DiskAccount)?.retryAt;
+		return timestamp(time) ? time : -Infinity;
+	};
+	const readFile = (path: string, name: string): DiskState | undefined => {
+		try {
+			const value = JSON.parse(readFileSync(path, "utf8"));
+			const valid = name === "routes" ? validDiskRoutes(value) : name === "management" ? validDiskManagement(value) : validDiskAccount(value);
+			return valid ? value : undefined;
+		} catch (err) {
+			if (!(err instanceof SyntaxError) && (err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			return undefined;
+		}
+	};
+	const read = <T>(scope: string, name: string): T | undefined => {
+		if (disabled) return undefined;
+		try {
+			let value = readFile(pathFor(scope, name), name);
+			let files: string[] = [];
+			try { files = readdirSync(journalDir(scope, name)); }
+			catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+			for (const file of files.filter((f) => f.endsWith(".json"))) {
+				const candidate = readFile(join(journalDir(scope, name), file), name);
+				const sameDeadline = deadline(candidate, name) === deadline(value, name);
+				const completed = name === "routes"
+					? (candidate as DiskRoutes)?.routeOwner === (value as DiskRoutes)?.routeOwner &&
+						!(candidate as DiskRoutes)?.routeFetchingUntil && Boolean((value as DiskRoutes)?.routeFetchingUntil)
+					: (candidate as DiskAccount)?.owner === (value as DiskAccount)?.owner &&
+						!(candidate as DiskAccount)?.fetchingUntil && Boolean((value as DiskAccount)?.fetchingUntil);
+				const newerData = name === "routes" ? ((candidate as DiskRoutes)?.routesAt ?? 0) > ((value as DiskRoutes)?.routesAt ?? 0)
+					: name !== "management" && ((candidate as DiskAccount)?.checkedAt ?? 0) > ((value as DiskAccount)?.checkedAt ?? 0);
+				if (candidate && (deadline(candidate, name) > deadline(value, name) || (sameDeadline && (completed || newerData)))) value = candidate;
+			}
+			return value as T | undefined;
+		} catch { disabled = true; return undefined; }
+	};
+	const write = (scope: string, name: string, value: DiskState, current: () => boolean) => {
+		const path = pathFor(scope, name);
+		const journals = journalDir(scope, name);
+		// Per-lease records fence stale writers: even a publication racing with eviction can NEVER
+		// erase a newer admission/cooldown. Readers take the maximum across these and the main file.
+		// Each publication has a new path, including completion/429 extensions of the same owner.
+		// Cleanup of an expired revision therefore cannot unlink a concurrently extended cooldown.
+		const recordPath = join(journals, `${randomUUID()}.json`);
+		const atomicWrite = (target: string) => {
+			const temp = `${target}.${randomUUID()}.tmp`;
+			try {
+				writeFileSync(temp, JSON.stringify(value), { mode: 0o600, flag: "wx", flush: true });
+				if (!current()) throw new Error("shared cache lock lost");
+				renameSync(temp, target);
+				if (!current()) throw new Error("shared cache lock lost");
+			} finally { try { unlinkSync(temp); } catch { /* rename succeeded or creation failed */ } }
+		};
+		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		mkdirSync(journals, { recursive: true, mode: 0o700 });
+		atomicWrite(recordPath); // Publish the non-overwritable lease BEFORE the convenient main file.
+		atomicWrite(path);
+		// Bound journal size; never remove unexpired cooldowns. Retain an extra TTL for slow readers.
+		for (const file of readdirSync(journals).filter((f) => f.endsWith(".json"))) {
+			const old = join(journals, file);
+			if (old !== recordPath && deadline(readFile(old, name), name) < clock() - QUOTA_TTL_MS && current()) {
+				try { unlinkSync(old); } catch { /* another process may already have pruned it */ }
+			}
+		}
+	};
+	const transaction = async <T>(scope: string, name: string, action: (read: <V>(name: string) => V | undefined, write: (name: string, value: DiskState) => void) => T, signal?: AbortSignal): Promise<{ kind: "ok"; value: T } | { kind: "busy" } | { kind: "disabled" }> => {
+		signal?.throwIfAborted();
+		if (disabled) return { kind: "disabled" };
+		let lock: QuotaLock | undefined;
+		try {
+			const path = join(root || "", digest(scope), "locks", `${name.replaceAll("/", "-")}.lock`);
+			mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+			lock = await acquireQuotaLock(path, signal);
+			if (!lock) return { kind: "busy" };
+			signal?.throwIfAborted();
+			if (!lock.current()) return { kind: "busy" };
+			const value = action(<V>(file: string) => read<V>(scope, file), (file, data) => {
+				if (disabled) throw new Error("shared cache unavailable");
+				if (!lock!.current()) throw new Error("shared cache lock lost");
+				write(scope, file, data, lock!.current);
+			});
+			if (!lock.current()) return { kind: "busy" };
+			return { kind: "ok", value };
+		} catch (err) {
+			if (signal?.aborted) throw err;
+			if ((err as Error).message === "shared cache lock lost") return { kind: "busy" };
+			disabled = true; // Unwritable home: preserve the existing in-memory safety net.
+			return { kind: "disabled" };
+		} finally { lock?.release(); }
+	};
+	return { read, transaction };
+}
+
+function validDiskAccount(disk?: DiskAccount): disk is DiskAccount {
+	if (!record(disk) || disk?.version !== 1 || !timestamp(disk.retryAt) || !Number.isSafeInteger(disk.failures) || disk.failures < 0) return false;
+	if (disk.windows !== undefined && (!Array.isArray(disk.windows) || !disk.windows.every((w) =>
+		w && typeof w.label === "string" && (w.remainingPct === null || finiteNumber(w.remainingPct)) &&
+		(w.resetIso === null || typeof w.resetIso === "string") &&
+		["tag", "group", "unit"].every((field) => w[field as keyof Win] === undefined || typeof w[field as keyof Win] === "string") &&
+		["used", "limit"].every((field) => w[field as keyof Win] == null || finiteNumber(w[field as keyof Win]))))) return false;
+	if (disk.manualResets !== undefined && (!record(disk.manualResets) ||
+		(disk.manualResets.availableCount !== null && !finiteNumber(disk.manualResets.availableCount)) ||
+		!Array.isArray(disk.manualResets.expiries) || !disk.manualResets.expiries.every((e) => e && finiteNumber(e.count) &&
+			(e.expiresAt === null || typeof e.expiresAt === "string")))) return false;
+	if ((disk.checkedAt !== undefined && !timestamp(disk.checkedAt)) ||
+		(disk.fetchingUntil !== undefined && !timestamp(disk.fetchingUntil)) ||
+		(disk.rateLimited !== undefined && typeof disk.rateLimited !== "boolean") ||
+		(disk.owner !== undefined && typeof disk.owner !== "string") ||
+		(disk.error !== undefined && typeof disk.error !== "string") ||
+		(disk.manualResetsError !== undefined && typeof disk.manualResetsError !== "string")) return false;
+	return true;
+}
+
+function mergeAccount(entry: AccountCache, disk?: DiskAccount): void {
+	if (!validDiskAccount(disk)) return;
+	// A matching lease's completion must replace its pending state even when timestamps are equal.
+	if (disk.retryAt < entry.retryAt || ((disk.checkedAt ?? 0) < (entry.checkedAt ?? 0) && disk.retryAt === entry.retryAt)) return;
+	// Flight is deliberately not serialized or replaced when another process updates the cache.
+	const { version: _version, ...data } = diskAccount(disk);
+	Object.assign(entry, data);
+}
+
+function validDiskRoutes(disk?: DiskRoutes): disk is DiskRoutes {
+	if (!record(disk) || disk?.version !== 1 || !timestamp(disk.routesAt) || !timestamp(disk.routeAttemptAt) || !timestamp(disk.routeRetryAt)) return false;
+	if (disk.routes !== undefined && !validRoutes(disk.routes)) return false;
+	if ((disk.routeFetchingUntil !== undefined && !timestamp(disk.routeFetchingUntil)) ||
+		(disk.routeOwner !== undefined && typeof disk.routeOwner !== "string") ||
+		(disk.routeError !== undefined && typeof disk.routeError !== "string")) return false;
+	return true;
+}
+
+function mergeRoutes(cache: ProxyCache, disk?: DiskRoutes): void {
+	if (!validDiskRoutes(disk)) return;
+	if (disk.routeAttemptAt < cache.routeAttemptAt || disk.routesAt < cache.routesAt) return;
+	cache.routes = disk.routes === undefined ? cache.routes : publicRoutes(disk.routes);
+	cache.routesAt = disk.routesAt;
+	cache.routeAttemptAt = disk.routeAttemptAt;
+	cache.routeRetryAt = disk.routeRetryAt;
+	cache.routeError = disk.routeError ? new Error(disk.routeError) : undefined;
+	cache.routeOwner = disk.routeOwner;
+	cache.routeFetchingUntil = disk.routeFetchingUntil;
+}
+
+function validDiskManagement(disk?: DiskManagement): disk is DiskManagement {
+	return Boolean(record(disk) && disk?.version === 1 && timestamp(disk.managementUntil) && Number.isSafeInteger(disk.managementFailures) && disk.managementFailures >= 0 &&
+		(disk.managementError === undefined || typeof disk.managementError === "string"));
+}
+
+function mergeManagement(cache: ProxyCache, disk?: DiskManagement): void {
+	if (!validDiskManagement(disk)) return;
+	if (disk.managementUntil >= cache.managementUntil) {
+		cache.managementUntil = disk.managementUntil;
+		cache.managementError = disk.managementError ? new Error(disk.managementError) : undefined;
+		cache.managementFailures = disk.managementFailures;
+	}
+}
+
+function diskAccount(entry: AccountCache): DiskAccount {
+	return { version: 1, windows: entry.windows, manualResets: entry.manualResets,
+		manualResetsError: entry.manualResetsError, checkedAt: entry.checkedAt, retryAt: entry.retryAt,
+		failures: entry.failures, error: entry.error, rateLimited: entry.rateLimited,
+		owner: entry.owner, fetchingUntil: entry.fetchingUntil };
+}
+function diskRoutes(cache: ProxyCache): DiskRoutes {
+	return { version: 1, routes: cache.routes && publicRoutes(cache.routes), routesAt: cache.routesAt,
+		routeAttemptAt: cache.routeAttemptAt, routeRetryAt: cache.routeRetryAt, routeError: cache.routeError?.message,
+		routeOwner: cache.routeOwner, routeFetchingUntil: cache.routeFetchingUntil };
 }
 
 function joinFlight<T>(flight: Flight<T>, signal?: AbortSignal): Promise<T> {
@@ -853,11 +1154,12 @@ export interface QuotaClient {
 
 /** Separate local routing discovery from rate-limited upstream quota, with per-auth admission control. */
 export function createQuotaClient(
-	options: { now?: () => number; random?: () => number } = {},
+	options: { now?: () => number; random?: () => number; cacheDir?: string | false } = {},
 	caches = new Map<string, ProxyCache>(),
 ): QuotaClient {
 	const clock = options.now ?? Date.now;
 	const random = options.random ?? Math.random;
+	const store = createSharedStore(options.cacheDir ?? join(AGENT_DIR, "cache", "cliproxyapi-quota"), clock);
 	const cacheFor = (base: string, key: string): ProxyCache => {
 		const id = scopeId(base, key);
 		let cache = caches.get(id);
@@ -868,11 +1170,34 @@ export function createQuotaClient(
 		return cache;
 	};
 	const backoff = (failures: number) => Math.min(MAX_BACKOFF_MS, QUOTA_TTL_MS * 2 ** Math.min(8, failures - 1) * (1 + random() * 0.2));
-	const managementFailure = (cache: ProxyCache, error: QuotaHttpError) => {
+	const managementFailure = async (base: string, key: string, cache: ProxyCache, error: QuotaHttpError) => {
 		if (error.scope !== "management" || error.status !== 429) return;
-		cache.managementFailures++;
-		cache.managementError = error;
-		cache.managementUntil = Math.max(cache.managementUntil, clock() + Math.max(backoff(cache.managementFailures), retryAfterMs(error.retryAfter, clock()) ?? 0));
+		let updated = false;
+		const update = () => {
+			cache.managementFailures++;
+			cache.managementError = error;
+			cache.managementUntil = Math.max(cache.managementUntil, clock() + Math.max(backoff(cache.managementFailures), retryAfterMs(error.retryAfter, clock()) ?? 0));
+			updated = true;
+		};
+		await store.transaction(scopeId(base, key), "management", (read, write) => {
+			mergeManagement(cache, read<DiskManagement>("management"));
+			update();
+			write("management", { version: 1, managementUntil: cache.managementUntil,
+				managementFailures: cache.managementFailures, managementError: cache.managementError?.message } satisfies DiskManagement);
+		});
+		if (!updated) update();
+	};
+	const managementSuccess = async (base: string, key: string, cache: ProxyCache) => {
+		if (cache.managementUntil > clock()) return;
+		if (cache.managementFailures === 0) return;
+		cache.managementFailures = 0;
+		await store.transaction(scopeId(base, key), "management", (read, write) => {
+			mergeManagement(cache, read<DiskManagement>("management"));
+			if (cache.managementUntil > clock()) return;
+			cache.managementFailures = 0;
+			write("management", { version: 1, managementUntil: cache.managementUntil,
+				managementFailures: 0, managementError: cache.managementError?.message } satisfies DiskManagement);
+		});
 	};
 	const accountStatus = (cache: ProxyCache, entry?: AccountCache): QuotaStatus => {
 		const managementBlocked = cache.managementUntil > clock();
@@ -881,6 +1206,7 @@ export function createQuotaClient(
 			checkedAt: entry?.checkedAt, error, manualResetsError: entry?.manualResetsError,
 			nextFetchAt: Math.max(entry?.retryAt ?? 0, cache.managementUntil) || undefined,
 			rateLimited: managementBlocked || entry?.rateLimited,
+			pendingElsewhere: Boolean((entry?.fetchingUntil ?? 0) > clock() && !entry?.flight),
 			retryAt: error ? Math.max(entry?.retryAt ?? 0, managementBlocked ? cache.managementUntil : 0) : undefined,
 			stale: Boolean(entry?.windows && (error || clock() - (entry.checkedAt ?? 0) >= QUOTA_TTL_MS)),
 		};
@@ -891,19 +1217,52 @@ export function createQuotaClient(
 		base = base.replace(/\/$/, "");
 		const cache = cacheFor(base, key);
 		if (cache.routeFlight && !cache.routeFlight.controller.signal.aborted) return joinFlight(cache.routeFlight, signal);
+		const scope = scopeId(base, key);
+		mergeManagement(cache, store.read<DiskManagement>(scope, "management"));
+		mergeRoutes(cache, store.read<DiskRoutes>(scope, "routes"));
 		if (cache.managementUntil > clock()) {
 			if (cache.routes) return cache.routes;
-			throw cache.managementError;
+			throw cache.managementError ?? new Error("management cooldown active");
 		}
 		if (cache.routes && ((!refresh && clock() - cache.routesAt < QUOTA_TTL_MS) || clock() - cache.routeAttemptAt < ROUTING_THROTTLE_MS)) return cache.routes;
+		if ((cache.routeFetchingUntil ?? 0) > clock()) return cache.routes ?? [];
 		if (cache.routeRetryAt > clock()) {
 			if (cache.routes) return cache.routes;
-			throw cache.routeError;
+			throw cache.routeError ?? new Error("routing refresh pending");
 		}
-		cache.routeAttemptAt = clock();
 		const controller = new AbortController();
+		const owner = randomUUID();
+		let admitted = false;
+		const due = () => cache.managementUntil <= clock() && cache.routeRetryAt <= clock() &&
+			(cache.routeFetchingUntil ?? 0) <= clock() && (!cache.routes ||
+				((refresh || clock() - cache.routesAt >= QUOTA_TTL_MS) && clock() - cache.routeAttemptAt >= ROUTING_THROTTLE_MS));
+		const reserve = () => {
+			cache.routeAttemptAt = clock();
+			cache.routeRetryAt = clock() + ROUTING_THROTTLE_MS;
+			cache.routeFetchingUntil = clock() + FETCH_LEASE_MS;
+			cache.routeOwner = owner;
+		};
 		const flight: Flight<CredentialModels[]> = { controller, users: 0, promise: Promise.resolve().then(async () => {
 			try {
+				const decision = await store.transaction(scope, "routes", (read, write) => {
+					mergeManagement(cache, read<DiskManagement>("management"));
+					mergeRoutes(cache, read<DiskRoutes>("routes"));
+					if (!due()) return false;
+					reserve();
+					write("routes", diskRoutes(cache));
+					return true;
+				}, controller.signal);
+				if (decision.kind === "busy" || (decision.kind === "ok" && !decision.value)) {
+					mergeRoutes(cache, store.read<DiskRoutes>(scope, "routes"));
+					if (decision.kind === "busy" && !cache.routes) cache.routeFetchingUntil = clock() + SHARED_POLL_MS;
+					return cache.routes ?? [];
+				}
+				if (decision.kind === "disabled") {
+					if (cache.routeOwner !== owner && !due()) return cache.routes ?? [];
+					reserve();
+				}
+				admitted = true;
+				controller.signal.throwIfAborted();
 				const creds = await listCredentials(base, key, controller.signal);
 				controller.signal.throwIfAborted();
 				const routes = await discoverCredentialModels(base, key, creds, controller.signal);
@@ -917,17 +1276,30 @@ export function createQuotaClient(
 				if (!controller.signal.aborted) {
 					cache.routeError = err as Error;
 					cache.routeRetryAt = clock() + ROUTING_THROTTLE_MS;
-					managementFailure(cache, err as QuotaHttpError);
+					await managementFailure(base, key, cache, err as QuotaHttpError);
 				}
 				throw err;
 			}
-		}).finally(() => { if (cache.routeFlight === flight) cache.routeFlight = undefined; }) };
+		}).finally(async () => {
+			if (admitted) {
+				cache.routeFetchingUntil = undefined;
+				await store.transaction(scope, "routes", (read, write) => {
+					const disk = read<DiskRoutes>("routes");
+					if (disk?.routeOwner === owner) write("routes", diskRoutes(cache));
+					else mergeRoutes(cache, disk);
+				});
+			}
+			if (cache.routeFlight === flight) cache.routeFlight = undefined;
+		}) };
 		cache.routeFlight = flight;
 		return joinFlight(flight, signal);
 	}
 
 	function snapshot(base: string, key: string, routes: CredentialModels[]): QuotaSnapshot {
 		const cache = cacheFor(base, key);
+		const scope = scopeId(base, key);
+		mergeManagement(cache, store.read<DiskManagement>(scope, "management"));
+		if (!cache.routeFlight) mergeRoutes(cache, store.read<DiskRoutes>(scope, "routes"));
 		// Discovery may complete while a long collection is still fetching account quotas.
 		// Never publish an older credential list over a newer registry result.
 		routes = cache.routes ?? routes;
@@ -936,12 +1308,15 @@ export function createQuotaClient(
 		const statuses = new Map<string, QuotaStatus>();
 		for (const { credential } of routes) {
 			const index = credential.auth_index as string;
-			const entry = cache.accounts.get(index);
+			let entry = cache.accounts.get(index);
+			if (!entry) { entry = { retryAt: 0, failures: 0 }; cache.accounts.set(index, entry); }
+			if (!entry.flight) mergeAccount(entry, store.read<DiskAccount>(scope, accountFile(index)));
 			if (entry?.windows) windows.set(index, entry.windows);
 			if (entry?.manualResets) manualResets.set(index, entry.manualResets);
 			statuses.set(index, accountStatus(cache, entry));
 		}
-		return { base: base.replace(/\/$/, ""), routes, windows, manualResets, statuses };
+		return { base: base.replace(/\/$/, ""), routes, windows, manualResets, statuses,
+			routingPending: (cache.routeFetchingUntil ?? 0) > clock() };
 	}
 
 	async function quota(base: string, key: string, cred: AuthFile, signal?: AbortSignal): Promise<void> {
@@ -952,13 +1327,37 @@ export function createQuotaClient(
 		let entry = cache.accounts.get(index);
 		if (!entry) { entry = { retryAt: 0, failures: 0 }; cache.accounts.set(index, entry); }
 		if (entry.flight && !entry.flight.controller.signal.aborted) return joinFlight(entry.flight, signal);
+		const scope = scopeId(base, key);
+		const file = accountFile(index);
+		mergeManagement(cache, store.read<DiskManagement>(scope, "management"));
+		mergeAccount(entry, store.read<DiskAccount>(scope, file));
 		if (cache.managementUntil > clock() || entry.retryAt > clock()) return;
-		// Every admitted attempt, including one interrupted after sending, has a minimum spacing.
-		entry.retryAt = clock() + QUOTA_TTL_MS;
 		const controller = new AbortController();
 		const account = entry;
+		const owner = randomUUID();
+		let admitted = false;
 		const flight: Flight<void> = { controller, users: 0, promise: Promise.resolve().then(async () => {
 			try {
+				const reservation = () => diskAccount({ ...account, owner,
+					retryAt: clock() + QUOTA_TTL_MS, fetchingUntil: clock() + FETCH_LEASE_MS });
+				const decision = await store.transaction(scope, file, (read, write) => {
+					mergeManagement(cache, read<DiskManagement>("management"));
+					mergeAccount(account, read<DiskAccount>(file));
+					if (cache.managementUntil > clock() || account.retryAt > clock()) return false;
+					const lease = reservation();
+					write(file, lease); // Durable admission BEFORE HTTP; crash still counts toward spacing.
+					mergeAccount(account, lease);
+					return true;
+				}, controller.signal);
+				if (decision.kind === "busy" || (decision.kind === "ok" && !decision.value)) {
+					mergeAccount(account, store.read<DiskAccount>(scope, file));
+					return;
+				}
+				if (decision.kind === "disabled") {
+					if (cache.managementUntil > clock() || account.retryAt > clock()) return;
+					mergeAccount(account, reservation());
+				}
+				admitted = true;
 				controller.signal.throwIfAborted();
 				const wins = await ADAPTERS[providerKey(cred)].fetch(base, key, cred, controller.signal);
 				controller.signal.throwIfAborted();
@@ -983,7 +1382,7 @@ export function createQuotaClient(
 				account.failures = 0;
 				account.error = undefined;
 				account.rateLimited = false;
-				if (cache.managementUntil <= clock()) cache.managementFailures = 0;
+				await managementSuccess(base, key, cache);
 			} catch (err) {
 				if (controller.signal.aborted) {
 					account.error = "refresh interrupted";
@@ -996,9 +1395,20 @@ export function createQuotaClient(
 					account.failures++;
 					account.retryAt = clock() + Math.max(backoff(account.failures), retryAfterMs(error.retryAfter, clock()) ?? 0);
 				}
-				managementFailure(cache, error);
+				await managementFailure(base, key, cache, error);
 			}
-		}).finally(() => { if (account.flight === flight) account.flight = undefined; }) };
+		}).finally(async () => {
+			if (admitted) {
+				account.fetchingUntil = undefined;
+				// No subscriber signal: cancellation must not discard admission/cooldown or successful windows.
+				await store.transaction(scope, file, (read, write) => {
+					const disk = read<DiskAccount>(file);
+					if (disk?.owner === owner) write(file, diskAccount(account));
+					else mergeAccount(account, disk); // Late completion cannot overwrite a newer lease.
+				});
+			}
+			if (account.flight === flight) account.flight = undefined;
+		}) };
 		account.flight = flight;
 		return joinFlight(flight, signal);
 	}
@@ -1009,7 +1419,11 @@ export function createQuotaClient(
 		signal?.throwIfAborted();
 		const known = routes.map((r) => r.credential).filter((c) => ADAPTERS[providerKey(c)])
 			.sort((a, b) => (providerKey(a) === "claude" ? 0 : 1) - (providerKey(b) === "claude" ? 0 : 1));
-		if (!known.length) throw new Error("NO_CRED");
+		if (!known.length) {
+			const result = snapshot(base, key, routes);
+			if (result.routingPending) return { blocks: ["Routing refresh pending in another session"], snapshot: result };
+			throw new Error("NO_CRED");
+		}
 		for (const cred of known) {
 			signal?.throwIfAborted();
 			await quota(base, key, cred, signal);
@@ -1043,7 +1457,7 @@ export function createQuotaClient(
 	return { routing, snapshot, collect };
 }
 
-// Survive extension reloads/duplicate loads in the same process. No secrets are persisted to disk.
+// L1 survives /reload; L2 shares sanitized quota/routing data and cooldowns across processes.
 const cacheSymbol = Symbol.for("pi-cliproxyapi-quota.cache.v1");
 const processCache = globalThis as typeof globalThis & { [key: symbol]: Map<string, ProxyCache> | undefined };
 const defaultQuotaClient = createQuotaClient({}, processCache[cacheSymbol] ??= new Map());
@@ -1514,8 +1928,8 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 	function nextPollDelay(): number {
 		const now = Date.now();
 		const future = [...(snapshot?.statuses?.values() ?? [])]
-			.flatMap((s) => s.nextFetchAt && s.nextFetchAt > now ? [s.nextFetchAt - now] : []);
-		return Math.max(1000, Math.min(QUOTA_TTL_MS, ...future));
+			.flatMap((s) => s.pendingElsewhere ? [SHARED_POLL_MS] : s.nextFetchAt && s.nextFetchAt > now ? [s.nextFetchAt - now] : []);
+		return Math.max(1000, Math.min(snapshot?.routingPending ? SHARED_POLL_MS : QUOTA_TTL_MS, ...future));
 	}
 
 	function schedule(ctx: ExtensionContext, initialQuota: boolean): void {

@@ -24,7 +24,7 @@ const deferred = () => {
 function setup(t, files) {
 	let now = NOW;
 	const h = {
-		client: createQuotaClient({ now: () => now, random: () => 0 }),
+		client: createQuotaClient({ cacheDir: false, now: () => now, random: () => 0 }),
 		files: files ?? [
 			{ id: "c", name: "claude.json", provider: "claude", auth_index: C },
 			{ id: "o", name: "codex.json", provider: "codex", auth_index: O, account_id: "offline-account" },
@@ -266,7 +266,7 @@ test("last subscriber cancellation discards late metadata and prevents the next 
 test("reload with legacy quota-only cache shows pending resets without bypassing five-minute spacing", async (t) => {
 	const h = setup(t);
 	const caches = new Map();
-	const previous = createQuotaClient({ now: () => h.now, random: () => 0 }, caches);
+	const previous = createQuotaClient({ cacheDir: false, now: () => h.now, random: () => 0 }, caches);
 	await previous.collect(BASE, "offline-key");
 	// Reproduce the process-shared cache shape written before manual reset support existed.
 	for (const cache of caches.values()) {
@@ -275,7 +275,7 @@ test("reload with legacy quota-only cache shows pending resets without bypassing
 			delete account.manualResetsError;
 		}
 	}
-	h.client = createQuotaClient({ now: () => h.now, random: () => 0 }, caches);
+	h.client = createQuotaClient({ cacheDir: false, now: () => h.now, random: () => 0 }, caches);
 	const cached = await h.collect();
 	assert.equal(cached.blocks.filter((line) => line === "  Manual resets: n/a (pending refresh) · refresh in 5m").length, 2);
 	assert.equal(cached.snapshot.windows.size, 2);
@@ -290,7 +290,7 @@ test("reload with legacy quota-only cache shows pending resets without bypassing
 test("legacy quota-only cache preserves an active 429 cooldown after reload", async (t) => {
 	const h = setup(t);
 	const caches = new Map();
-	const previous = createQuotaClient({ now: () => h.now, random: () => 0 }, caches);
+	const previous = createQuotaClient({ cacheDir: false, now: () => h.now, random: () => 0 }, caches);
 	await previous.collect(BASE, "offline-key");
 	for (const cache of caches.values()) {
 		for (const account of cache.accounts.values()) {
@@ -300,7 +300,7 @@ test("legacy quota-only cache preserves an active 429 cooldown after reload", as
 			account.retryAt = h.now + 3_600_000;
 		}
 	}
-	h.client = createQuotaClient({ now: () => h.now, random: () => 0 }, caches);
+	h.client = createQuotaClient({ cacheDir: false, now: () => h.now, random: () => 0 }, caches);
 	const cached = await h.collect();
 	assert.equal(cached.blocks.filter((line) => line === "  Manual resets: n/a (pending refresh) · refresh in 1h 0m").length, 2);
 	assert.equal(h.count(C), 1);
@@ -310,8 +310,8 @@ test("legacy quota-only cache preserves an active 429 cooldown after reload", as
 test("reset data survives same-process client replacement", async (t) => {
 	const h = setup(t);
 	const caches = new Map();
-	const first = createQuotaClient({ now: () => h.now }, caches);
-	const second = createQuotaClient({ now: () => h.now }, caches);
+	const first = createQuotaClient({ cacheDir: false, now: () => h.now }, caches);
+	const second = createQuotaClient({ cacheDir: false, now: () => h.now }, caches);
 	await first.collect(BASE, "offline-key");
 	const result = await second.collect(BASE, "offline-key");
 	assert.equal(result.snapshot.manualResets.get(C).availableCount, 3);

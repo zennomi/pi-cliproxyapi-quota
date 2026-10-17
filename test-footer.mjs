@@ -19,7 +19,7 @@ function setup(t) {
 	const statuses = [];
 	const notifications = [];
 	let now = Date.parse("2026-10-08T12:00:00Z");
-	const client = createQuotaClient({ now: () => now, random: () => 0 });
+	const client = createQuotaClient({ cacheDir: false, now: () => now, random: () => 0 });
 	t.mock.method(Date, "now", () => now);
 	let requests = 0;
 	let allRequests = 0;
@@ -98,7 +98,7 @@ function setup(t) {
 		}
 	});
 	return {
-		ctx, handlers, commands, timers, statuses, notifications, models, registryFailures, quotaFailures, usageRequests, usageTimes,
+		ctx, client, handlers, commands, timers, statuses, notifications, models, registryFailures, quotaFailures, usageRequests, usageTimes,
 		advance(ms) { now += ms; },
 		set latency(value) { latency = value; },
 		get requests() { return requests; },
@@ -546,4 +546,22 @@ test("quota renders as its own line below the built-in footer, without setStatus
 
 	await h.emit("session_shutdown");
 	assert.equal(h.footer, undefined);
+});
+
+test("pending disk work polls locally after ten seconds, not another five minutes", async (t) => {
+	const h = setup(t);
+	const collect = h.client.collect;
+	let pending = true;
+	t.mock.method(h.client, "collect", async (...args) => {
+		const result = await collect(...args);
+		for (const status of result.snapshot.statuses.values()) status.pendingElsewhere = pending;
+		return result;
+	});
+	await h.emit("session_start");
+	assert.equal([...h.timers.values()][0].ms, 10_000);
+	const requests = h.allRequests;
+	pending = false;
+	await h.poll();
+	assert.equal(h.allRequests, requests, "short poll only reads cache while account TTL is active");
+	assert.equal([...h.timers.values()][0].ms, FIVE_MINUTES - 10_000);
 });
