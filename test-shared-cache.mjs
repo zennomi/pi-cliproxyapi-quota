@@ -9,7 +9,75 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setImmediate } from "node:timers/promises";
-import { acquireQuotaLock, createQuotaClient, quotaFooter } from "./index.ts";
+import { acquireQuotaLock, createQuotaClient, quotaFooter, resolveModelAuth } from "./index.ts";
+
+const RELAY = "9a0e503ba745404d";
+const relayEntry = () => ({ name: "ch-relay", "auth-index": RELAY, "base-url": "http://127.0.0.1:11600/v1?token=secret",
+	models: [{ name: "gpt-6-astra", alias: "" }, { name: "original", alias: "friendly" }],
+	"api-key-entries": [{ "api-key": "never-persist-api-key" }], headers: { secret: "never-persist-header" } });
+function compatSetup(t, entries = [relayEntry()], status = 200) {
+	const calls = [];
+	let now = NOW;
+	t.mock.method(globalThis, "fetch", async (input, options) => {
+		const url = new URL(String(input));
+		assert.equal(url.origin, BASE);
+		if (url.pathname.endsWith("/auth-files")) return Response.json({ files: [] });
+		if (url.pathname.endsWith("/openai-compatibility")) return Response.json({ "openai-compatibility": entries }, { status });
+		assert.ok(url.pathname.endsWith("/api-call"));
+		const call = JSON.parse(options.body);
+		calls.push(call);
+		assert.equal(call.authIndex, RELAY);
+		assert.deepEqual(call.header, { Accept: "application/json" });
+		assert.equal(call.method, "GET");
+		if (call.url.endsWith("/rate-limit-reset-credits")) return Response.json({ status_code: 200,
+			body: JSON.stringify({ available_count: 2, credits: [] }) });
+		assert.equal(call.url, "http://127.0.0.1:11600/_gateway/usage");
+		return Response.json({ status_code: 200, body: JSON.stringify({ rate_limit: {
+			primary_window: { used_percent: 12, limit_window_seconds: 18000 },
+			secondary_window: { used_percent: 4, limit_window_seconds: 604800 },
+		} }) });
+	});
+	return { calls, advance(ms) { now += ms; }, client: (cacheDir = false) => createQuotaClient({ cacheDir, now: () => now, random: () => 0 }) };
+}
+
+test("compat discovery filters invalid entries, preserves aliases, and isolates adapters", async (t) => {
+	const h = compatSetup(t, [relayEntry(), { ...relayEntry(), disabled: true, "auth-index": O },
+		{ ...relayEntry(), name: "", "auth-index": O }, { ...relayEntry(), "auth-index": "bad" },
+		{ name: "codex", "auth-index": C, "base-url": "https://unrelated.invalid/v1", models: [{ name: "friendly" }] }]);
+	const client = h.client();
+	const result = await client.collect(BASE, KEY);
+	assert.equal(result.snapshot.routes.length, 2);
+	assert.equal(resolveModelAuth("gpt-6-astra", result.snapshot.routes).credential.auth_index, RELAY);
+	assert.equal(resolveModelAuth("friendly", result.snapshot.routes).kind, "ambiguous");
+	assert.equal(resolveModelAuth(null, result.snapshot.routes, RELAY).source, "trace");
+	assert.equal(result.snapshot.windows.get(RELAY)[0].remainingPct, 88);
+	assert.equal(result.snapshot.manualResets.get(RELAY).availableCount, 2);
+	assert.equal(result.snapshot.windows.has(C), false, "compat named codex cannot use OAuth adapter");
+	assert.equal(h.calls.length, 2);
+	await client.collect(BASE, KEY);
+	assert.equal(h.calls.length, 2, "five-minute admission also protects compat accounts");
+});
+
+test("compat routing stores only allowlisted metadata and survives a new client", async (t) => {
+	const dir = temp(t);
+	const h = compatSetup(t);
+	await h.client(dir).collect(BASE, KEY);
+	const disk = readFileSync(join(scopeDir(dir), "routes.json"), "utf8");
+	for (const secret of ["never-persist-api-key", "never-persist-header", "token=secret"]) assert.ok(!disk.includes(secret));
+	assert.equal(JSON.parse(disk).routes[0].credential.base_url, "http://127.0.0.1:11600");
+	const result = await h.client(dir).collect(BASE, KEY);
+	assert.equal(result.snapshot.windows.get(RELAY)[0].remainingPct, 88);
+	assert.match(quotaFooter(result.snapshot, "gpt-6-astra"), /^ch-relay 5h/);
+	assert.equal(h.calls.length, 2);
+});
+
+for (const status of [404, 503, 429]) test("compat registry HTTP " + status, async (t) => {
+	const h = compatSetup(t, [], status);
+	const client = h.client();
+	if (status === 404) assert.deepEqual(await client.routing(BASE, KEY), []);
+	else await assert.rejects(client.routing(BASE, KEY), /management HTTP/);
+	assert.equal(h.calls.length, 0);
+});
 
 const TTL = 300_000;
 const NOW = Date.parse("2026-10-17T05:00:00Z");
@@ -45,6 +113,7 @@ function setup(t) {
 	t.mock.method(globalThis, "fetch", async (input, options) => {
 		const url = new URL(String(input));
 		assert.ok([BASE, "http://mock-other-shared"].includes(url.origin), "no live URL may escape");
+		if (url.pathname.endsWith("/openai-compatibility")) return Response.json({ "openai-compatibility": [] });
 		if (url.pathname.endsWith("/auth-files")) {
 			h.list++;
 			h.listStarted.resolve();
@@ -92,7 +161,9 @@ async function mockServer(t) {
 		for await (const chunk of req) chunks.push(chunk);
 		const data = Buffer.concat(chunks).toString();
 		let body;
-		if (req.url.endsWith("/auth-files")) {
+		if (req.url.endsWith("/openai-compatibility")) {
+			body = { "openai-compatibility": [] };
+		} else if (req.url.endsWith("/auth-files")) {
 			h.list++;
 			body = { files: [{ id: "c", name: "Claude.json", provider: "claude", auth_index: C }] };
 		} else if (req.url.includes("/auth-files/models?")) {

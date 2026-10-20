@@ -39,6 +39,7 @@ function setup(t, files) {
 	t.mock.method(globalThis, "fetch", async (input, options) => {
 		const url = new URL(String(input));
 		assert.equal(url.origin, BASE, "never contact a live proxy");
+		if (url.pathname.endsWith("/openai-compatibility")) return Response.json({ "openai-compatibility": [] });
 		if (url.pathname.endsWith("/auth-files")) return Response.json({ files: h.files });
 		if (url.pathname.endsWith("/auth-files/models")) return Response.json({ models: [{ id: "shared-model" }] });
 		assert.ok(url.pathname.endsWith("/api-call"));

@@ -95,6 +95,7 @@ export interface AuthFile {
 	label?: string;
 	project_id?: string;
 	account_id?: string;
+	base_url?: string;
 }
 
 type ResponseHeaders = Record<string, string | string[]>;
@@ -173,8 +174,46 @@ async function listCredentials(base: string, key: string, signal?: AbortSignal):
 	});
 }
 
+/** Compat credentials are config-backed, not auth-files; their advertised aliases are the registry. */
+async function listOpenAICompat(base: string, key: string, signal?: AbortSignal): Promise<CredentialModels[]> {
+	let data: Record<string, unknown>;
+	try {
+		data = await mgmtGet<Record<string, unknown>>(base, key, "openai-compatibility", signal);
+	} catch (err) {
+		if (!signal?.aborted && (err as QuotaHttpError).status === 404) return [];
+		throw err;
+	}
+	const entries = data["openai-compatibility"];
+	if (!Array.isArray(entries)) throw new Error("invalid OpenAI compatibility registry response");
+	const routes: CredentialModels[] = [];
+	for (const value of entries) {
+		const entry = record(value);
+		const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+		const index = entry?.["auth-index"];
+		if (!name || entry?.disabled || typeof index !== "string" || !/^[a-f\d]{16}$/i.test(index)) continue;
+		let baseUrl: string | undefined;
+		try {
+			const url = new URL(String(entry?.["base-url"] ?? ""));
+			// Never retain URL credentials/query secrets in shared routing metadata.
+			if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password) baseUrl = url.origin;
+		} catch { /* Unknown base URL stays explicit; never guess an endpoint. */ }
+		const models = entry?.models;
+		const modelIds = Array.isArray(models) ? models.flatMap((value) => {
+			const model = record(value);
+			const id = firstString(model?.alias, model?.name);
+			return id ? [id] : [];
+		}) : null;
+		routes.push({ credential: {
+			id: `openai-compatibility:${name}`, name, provider: name.toLowerCase(), type: "openai-compatibility",
+			label: name, auth_index: index, ...(baseUrl ? { base_url: baseUrl } : {}),
+		}, modelIds });
+	}
+	return routes;
+}
+
 // Normalize provider name the same way the GUI does.
 function providerKey(f: AuthFile): string {
+	if (f.type === "openai-compatibility") return f.name.trim().toLowerCase();
 	const raw = (f.provider ?? f.type ?? "").trim().toLowerCase().replace(/_/g, "-");
 	if (raw === "x-ai" || raw === "grok") return "xai";
 	if (raw === "kiro-ha") return "kiro";
@@ -676,6 +715,33 @@ const ADAPTERS: Record<string, Adapter> = {
 	kiro: kiroAdapter,
 };
 
+const COMPAT_ADAPTERS: Record<string, Adapter> = {
+	"ch-relay": {
+		verified: true,
+		async fetch(base, key, cred, signal) {
+			return parseCodexUsage(await chRelayCall(base, key, cred, "usage", signal));
+		},
+		async fetchManualResets(base, key, cred, signal) {
+			return parseCodexManualResets(await chRelayCall(base, key, cred, "rate-limit-reset-credits", signal));
+		},
+	},
+};
+
+async function chRelayCall(base: string, key: string, cred: AuthFile, resource: string, signal?: AbortSignal): Promise<string> {
+	if (!cred.base_url) throw new Error("ch-relay base-url unknown");
+	return proxyCall(base, key, {
+		authIndex: cred.auth_index as string, method: "GET",
+		url: new URL(`/_gateway/${resource}`, cred.base_url).href,
+		header: { Accept: "application/json" },
+	}, signal);
+}
+
+function adapterFor(cred: AuthFile): Adapter | undefined {
+	const registry = cred.type === "openai-compatibility" ? COMPAT_ADAPTERS : ADAPTERS;
+	const name = providerKey(cred);
+	return Object.hasOwn(registry, name) ? registry[name] : undefined;
+}
+
 export interface ProxyModel {
 	provider?: string;
 	id?: string;
@@ -936,14 +1002,14 @@ const timestamp = (value: unknown): value is number => finiteNumber(value) && va
 function publicRoutes(routes: CredentialModels[]): CredentialModels[] {
 	return routes.map(({ credential: c, modelIds }) => ({ credential: {
 		id: c.id, name: c.name, provider: c.provider, type: c.type, auth_index: c.auth_index,
-		disabled: c.disabled, email: c.email, label: c.label, project_id: c.project_id, account_id: c.account_id,
+		disabled: c.disabled, email: c.email, label: c.label, project_id: c.project_id, account_id: c.account_id, base_url: c.base_url,
 	}, modelIds }));
 }
 
 function validRoutes(value: unknown): value is CredentialModels[] {
 	return Array.isArray(value) && value.every((r) => r && typeof r === "object" && r.credential &&
 		typeof r.credential.id === "string" && typeof r.credential.name === "string" && typeof r.credential.auth_index === "string" &&
-		["provider", "type", "email", "label", "project_id", "account_id"].every((field) =>
+		["provider", "type", "email", "label", "project_id", "account_id", "base_url"].every((field) =>
 			r.credential[field] === undefined || typeof r.credential[field] === "string") &&
 		(r.credential.disabled === undefined || typeof r.credential.disabled === "boolean") &&
 		(r.modelIds === null || (Array.isArray(r.modelIds) && r.modelIds.every((id: unknown) => typeof id === "string"))));
@@ -1263,10 +1329,19 @@ export function createQuotaClient(
 				}
 				admitted = true;
 				controller.signal.throwIfAborted();
-				const creds = await listCredentials(base, key, controller.signal);
+				const [creds, compatRoutes] = await Promise.all([
+					listCredentials(base, key, controller.signal), listOpenAICompat(base, key, controller.signal),
+				]);
 				controller.signal.throwIfAborted();
-				const routes = await discoverCredentialModels(base, key, creds, controller.signal);
+				const oauthRoutes = await discoverCredentialModels(base, key, creds, controller.signal);
 				controller.signal.throwIfAborted();
+				const seen = new Set<string>();
+				const routes = [...oauthRoutes, ...compatRoutes].filter(({ credential }) => {
+					const index = credential.auth_index as string;
+					if (seen.has(index)) return false;
+					seen.add(index);
+					return true;
+				});
 				cache.routes = routes;
 				cache.routesAt = clock();
 				cache.routeRetryAt = 0;
@@ -1359,12 +1434,14 @@ export function createQuotaClient(
 				}
 				admitted = true;
 				controller.signal.throwIfAborted();
-				const wins = await ADAPTERS[providerKey(cred)].fetch(base, key, cred, controller.signal);
+				const adapter = adapterFor(cred);
+				if (!adapter) return;
+				const wins = await adapter.fetch(base, key, cred, controller.signal);
 				controller.signal.throwIfAborted();
 				account.windows = wins;
 				account.checkedAt = clock();
 				// Keep admission-based spacing; completion latency must not add another TTL.
-				const fetchResets = ADAPTERS[providerKey(cred)].fetchManualResets;
+				const fetchResets = adapter.fetchManualResets;
 				if (fetchResets) {
 					try {
 						controller.signal.throwIfAborted();
@@ -1417,7 +1494,7 @@ export function createQuotaClient(
 		base = base.replace(/\/$/, "");
 		const routes = await routing(base, key, signal);
 		signal?.throwIfAborted();
-		const known = routes.map((r) => r.credential).filter((c) => ADAPTERS[providerKey(c)])
+		const known = routes.map((r) => r.credential).filter((c) => adapterFor(c))
 			.sort((a, b) => (providerKey(a) === "claude" ? 0 : 1) - (providerKey(b) === "claude" ? 0 : 1));
 		if (!known.length) {
 			const result = snapshot(base, key, routes);
@@ -1434,14 +1511,15 @@ export function createQuotaClient(
 		for (const cred of known) {
 			const index = cred.auth_index as string;
 			const pk = providerKey(cred);
+			const adapter = adapterFor(cred)!;
 			const status = result.statuses?.get(index);
 			const wins = result.windows.get(index);
-			const heading = `● ${cred.email || cred.label || cred.name} [${pk}]${ADAPTERS[pk].verified ? "" : " (unverified)"}`;
+			const heading = `● ${cred.email || cred.label || cred.name} [${pk}]${adapter.verified ? "" : " (unverified)"}`;
 			blocks.push(heading + (status?.stale ? " (cached, stale)" : ""));
 			if (wins) blocks.push(...renderWindows(wins, now));
 			const resets = result.manualResets?.get(index);
 			if (resets) blocks.push(...renderManualResets(resets, now, Boolean(status?.stale || status?.manualResetsError)));
-			else if (ADAPTERS[pk].fetchManualResets && !status?.manualResetsError) {
+			else if (adapter.fetchManualResets && !status?.manualResetsError) {
 				// Reload can inherit quota-only cache entries from an older extension.
 				// Show the missing metadata explicitly; never bypass admission/cooldown to fill it.
 				const refreshAt = status?.nextFetchAt;

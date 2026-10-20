@@ -36,6 +36,7 @@ function setup(t, two = false) {
 	t.mock.method(globalThis, "fetch", async (input, options) => {
 		const url = new URL(String(input));
 		assert.ok([BASE, "http://mock-reload-cache", "http://mock-other-proxy"].includes(url.origin), "a live URL must never escape the mock");
+		if (url.pathname.endsWith("/openai-compatibility")) return Response.json({ "openai-compatibility": [] });
 		if (url.pathname.endsWith("/auth-files")) {
 			h.list++;
 			if (h.listGate) await h.listGate;

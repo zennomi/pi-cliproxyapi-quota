@@ -33,9 +33,25 @@ endpoints report utilization; they do not consume quota. Disabled credentials ar
 
 Manual resets are read-only: Claude reads banked grants from `/api/oauth/usage?cedar_ember=1&skip_spend=1`; Codex reads `/backend-api/wham/rate-limit-reset-credits`. These follow the same per-account cache, single-flight, cancellation, and 429 cooldown as quota windows. Expiries are sorted earliest first; Claude grants containing multiple resets show their count. A reset-data failure preserves quota windows and marks cached reset data stale. No reset is consumed. After upgrading with `/reload`, a pre-existing quota-only cache shows `Manual resets: n/a (pending refresh)` until the next permitted refresh; upgrading never bypasses the five-minute interval or an active 429 cooldown. Manual reset parsing is based on the management panel; live verification is pending.
 
+### OpenAI-compatible ch-relay
+
+An enabled OpenAI-compatible entry named **`ch-relay`** is also supported (5h/weekly windows and read-only
+manual resets). Requires the ch-relay Python gateway with `GET /_gateway/usage` and
+`GET /_gateway/rate-limit-reset-credits` deployed; older gateways return 404 until rebuilt.
+The extension discovers its `auth-index`, model aliases and `base-url` via
+`GET /v0/management/openai-compatibility`. It calls the gateway through management `api-call`
+(from the proxy host), using the origin of `base-url`, not a hardcoded port.
+The gateway injects its own Codex OAuth credential; pi never reads that credential or license.
+
+Other OpenAI-compatible entries participate in routing/ambiguity but do not have quota adapters.
+The entry name selects the compat adapter, never a model-family guess; a compat entry named `codex`
+cannot use the OAuth Codex adapter. Older proxies returning 404 for this registry remain supported.
+Routing caches persist only allowlisted metadata, including the credential-free gateway origin.
+After deployment, run `/reload` and `/quota`; existing cache/cooldown intervals still apply.
+
 ### Dynamic model and account routing
 
-- The extension reads `GET /v0/management/auth-files` and `GET /v0/management/auth-files/models?name=…` to match the current model against each credential's registered IDs, including aliases and prefixes. Model names and pi provider labels are not used to guess the upstream provider.
+- The extension reads `GET /v0/management/auth-files` and `GET /v0/management/auth-files/models?name=…` to match the current model against each credential's registered IDs, including aliases and prefixes. OpenAI-compatible entries are discovered separately from `GET /v0/management/openai-compatibility`, using their configured model aliases (they are not auth-files). Model names and pi provider labels are not used to guess the upstream provider.
 - With one matching credential, its quota is shown immediately. With multiple matches (even within one provider), the footer shows e.g. `claude/antigravity auth pending (2 accounts)` until a response identifies the account.
 - Pi's `after_provider_response` event supplies `X-CPA-TRACE-ID` (`timestamp-auth_index-request_id`). The extension uses that index to select the exact account's cached quota without delaying stream consumption. Multiple accounts of one provider are distinguished by a short auth index in the footer.
 - This describes the last safely attributed conversational request, not a permanent account pin: each new request can choose another account. Idle cache-warming callbacks are ignored and do not erase that selection. Selection is cleared for new requests, model changes, and session changes. If the model changes during a run, trace attribution is conservatively skipped until the next run so a delayed old request cannot be assigned to the new model. Quota/model data is cached in memory and on disk across sessions, and refreshed every five minutes subject to shared admission/cooldown.
@@ -91,7 +107,7 @@ If you don’t run the GUI, set `CLIPROXYAPI_MANAGEMENT_KEY` (must match your pr
 
 ## Scope & limitations
 
-- **Verified** (tested against live accounts): `claude`, `antigravity` / `gemini`, `kimi`, `codex`, `kiro`.
+- **Verified** (tested against live accounts): `claude`, `antigravity` / `gemini`, `kimi`, `codex`, `kiro`, and OpenAI-compatible `ch-relay` (including manual resets via its gateway; see prerequisites above).
 - **Unverified** (ported from the EasyCLIProxyAPI panel, endpoints + parsers wired but not yet tested
   against a real account): `xai` / `grok`. These are labelled `(unverified)` in the
   output. If one is wrong for your account, please open an issue with the raw response — easy to fix.

@@ -31,6 +31,7 @@ function setup(t) {
 	let pause;
 	const registryFailures = new Set();
 	const quotaFailures = new Set();
+	let compat = [];
 	let files = [
 		{ id: "claude-1", provider: "claude", auth_index: CLAUDE, name: "Claude.json" },
 		{ id: "codex-1", provider: "codex", auth_index: CODEX, name: "Codex.json" },
@@ -47,6 +48,7 @@ function setup(t) {
 		allRequests++;
 		now += latency;
 		const url = new URL(String(input));
+		if (url.pathname.endsWith("/openai-compatibility")) return Response.json({ "openai-compatibility": compat });
 		if (url.pathname.endsWith("/auth-files")) {
 			requests++;
 			if (pause) await pause;
@@ -105,6 +107,7 @@ function setup(t) {
 		get allRequests() { return allRequests; },
 		get footer() { return statuses.at(-1); },
 		set files(value) { files = value; },
+		set compat(value) { compat = value; },
 		set fail(value) { fail = value; },
 		set pause(value) { pause = value; },
 		async emit(name, context = ctx, event = {}) {
@@ -139,6 +142,22 @@ function setup(t) {
 		},
 	};
 }
+
+test("ch-relay registry and trace render the compat quota footer", async (t) => {
+	const h = setup(t);
+	const index = "9a0e503ba745404d";
+	h.files = [];
+	h.compat = [{ name: "ch-relay", "auth-index": index, "base-url": "http://127.0.0.1:11600/v1",
+		models: [{ name: "gpt-6-astra", alias: "" }] }];
+	h.ctx.model = proxyModel("gpt-6-astra");
+	await h.emit("session_start");
+	assert.ok(h.footer.startsWith("ch-relay 5h"), h.footer);
+	assert.equal(h.usageRequests.get(index), 1);
+	await h.emit("before_provider_request");
+	await h.response(index);
+	assert.ok(h.footer.startsWith("ch-relay 5h"));
+	assert.equal(h.usageRequests.get(index), 1, "trace does not refetch usage");
+});
 
 test("load and idle 5-minute polling use runtime registry, not model names", async (t) => {
 	const h = setup(t);
@@ -349,7 +368,7 @@ test("disabled and index-less credentials do not affect discovery", async (t) =>
 	h.models.set(SECOND, ["friendly-alias"]);
 	await h.emit("session_start");
 	assert.ok(h.footer.startsWith("claude "));
-	assert.equal(h.allRequests, 4, "one list, one registry, one quota request, one manual reset read");
+	assert.equal(h.allRequests, 5, "two credential lists, one registry, one quota request, one manual reset read");
 });
 
 test("removing all credentials clears previously cached account quota", async (t) => {
@@ -502,7 +521,7 @@ test("shutdown during discovery prevents any subsequent upstream quota request",
 	release();
 	await setImmediate();
 	assert.equal(h.usageRequests.size, 0);
-	assert.equal(h.allRequests, 1, "not even per-auth model discovery starts after shutdown");
+	assert.equal(h.allRequests, 2, "only the parallel credential lists started; no per-auth discovery after shutdown");
 });
 
 test("old quota refresh cannot overwrite a newly selected model", async (t) => {

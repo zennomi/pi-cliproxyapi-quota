@@ -34,7 +34,7 @@ Add this directory's `index.ts` absolute path to the `extensions` array in
 
 ## Dynamic routing
 
-- Discover model → credential candidates with `GET /v0/management/auth-files/models?name=<name>` for every enabled credential, including providers without quota adapters. Never infer the routing provider from model-family names or pi provider labels.
+- Discover model → credential candidates with `GET /v0/management/auth-files/models?name=<name>` for every enabled OAuth credential, including providers without quota adapters. Also discover config-backed OpenAI-compatible entries via `GET /v0/management/openai-compatibility` (404 → empty); use their configured model aliases and auth-index, not auth-files/models. Never infer the routing provider from model-family names or pi provider labels.
 - Resolve the selected credential from HTTP response `X-CPA-TRACE-ID` (`timestamp-auth_index-request_id`) through pi's `after_provider_response` event. Store quota windows by `auth_index`, not by provider.
 - Multiple candidates, missing discovery, or unknown auth must not fall back to the first account. Model/session changes clear trace selection and invalidate late refreshes. Automatic footer updates require the model endpoint to match the configured proxy.
 - Model switches and unknown trace auth refresh local routing only (unknown traces are throttled to once/minute). They must never trigger an upstream quota scan.
@@ -52,9 +52,10 @@ Add this directory's `index.ts` absolute path to the `extensions` array in
 
 ## Scope
 
+- Compat registry in `index.ts` (`COMPAT_ADAPTERS`): exact entry name `ch-relay` → gateway origin `/_gateway/usage` and `/_gateway/rate-limit-reset-credits` via management api-call. Reuses Codex parsers. Requires updated `/Users/tuananhnguyendang/Me/ch-relay/docker/gateway.py`; gateway owns OAuth refresh. `adapterFor` keeps compat entries separate from OAuth adapters, even if names collide. Persist only credential-free gateway origin as `base_url`, never config API keys/headers.
 - Provider registry in `index.ts` (`ADAPTERS`): one adapter per OAuth provider, each with its own
   endpoint / headers / body and a parser that normalizes to `Win { label, remainingPct, resetIso }`.
-- **Verified** against live accounts: `claude`, `antigravity` / `gemini`, `kimi`, `codex`, `kiro`.
+- **Verified** against live accounts: `claude`, `antigravity` / `gemini`, `kimi`, `codex`, `kiro`, OpenAI-compatible `ch-relay` (quota + manual resets via gateway).
 - **Unverified** (endpoints + parsers ported from the EasyCLIProxyAPI panel, not yet tested on a real
   account, shown as `(unverified)` in output): `xai` / `grok`. To verify one: run its
   request through `POST /v0/management/api-call` with a real credential, compare the raw JSON to the

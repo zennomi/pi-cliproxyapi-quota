@@ -305,6 +305,7 @@ const offlineOptions = { client: createQuotaClient({ cacheDir: false }) };
 try {
 	globalThis.fetch = async (input) => {
 		const url = String(input);
+		if (url.endsWith("/openai-compatibility")) return Response.json({ "openai-compatibility": [] });
 		if (url.endsWith("/auth-files")) {
 			return Response.json({
 				files: [
