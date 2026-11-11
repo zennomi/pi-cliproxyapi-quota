@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { setImmediate } from "node:timers/promises";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
 import quotaExtension, { createQuotaClient } from "./index.ts";
 
 const FIVE_MINUTES = 5 * 60_000;
@@ -15,6 +16,7 @@ const proxyModel = (id) => ({ provider: "arbitrary-proxy-name", id, baseUrl: `${
 function setup(t) {
 	const handlers = new Map();
 	const commands = new Map();
+	const shortcuts = new Map();
 	const timers = new Map();
 	const statuses = [];
 	const notifications = [];
@@ -25,6 +27,7 @@ function setup(t) {
 	let allRequests = 0;
 	let latency = 0;
 	const usageRequests = new Map();
+	const usageBodies = new Map();
 	const usageTimes = new Map();
 	let runStarted = false;
 	let fail = false;
@@ -68,7 +71,7 @@ function setup(t) {
 		usageRequests.set(body.authIndex, (usageRequests.get(body.authIndex) ?? 0) + 1);
 		usageTimes.set(body.authIndex, [...(usageTimes.get(body.authIndex) ?? []), now]);
 		if (quotaFailures.has(body.authIndex)) return Response.json({ error: "unavailable" }, { status: 503 });
-		return Response.json({ status_code: 200, body: JSON.stringify({
+		return Response.json({ status_code: 200, body: JSON.stringify(usageBodies.get(body.authIndex) ?? {
 			five_hour: { utilization: body.authIndex === SECOND ? 90 : 20 },
 			rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 18000 } },
 		}) });
@@ -90,7 +93,7 @@ function setup(t) {
 	quotaExtension({
 		on: (name, handler) => handlers.set(name, handler),
 		registerCommand: (name, command) => commands.set(name, command),
-		registerShortcut: () => {},
+		registerShortcut: (key, shortcut) => shortcuts.set(key, shortcut),
 	}, client);
 	t.after(() => {
 		handlers.get("session_shutdown")?.({}, ctx);
@@ -100,7 +103,7 @@ function setup(t) {
 		}
 	});
 	return {
-		ctx, client, handlers, commands, timers, statuses, notifications, models, registryFailures, quotaFailures, usageRequests, usageTimes,
+		ctx, client, handlers, commands, shortcuts, timers, statuses, notifications, models, registryFailures, quotaFailures, usageRequests, usageTimes, usageBodies,
 		advance(ms) { now += ms; },
 		set latency(value) { latency = value; },
 		get requests() { return requests; },
@@ -142,6 +145,159 @@ function setup(t) {
 		},
 	};
 }
+
+function panelHarness(h) {
+	const ui = { terminal: { rows: 30 }, renders: 0, requestRender() { this.renders++; } };
+	let component;
+	let options;
+	let opens = 0;
+	let closes = 0;
+	h.ctx.ui.custom = (factory, opts) => new Promise((resolve) => {
+		opens++;
+		options = opts;
+		const matches = (data, name) => ({
+			"tui.select.cancel": "escape", "tui.select.up": "up", "tui.select.down": "down",
+			"tui.select.pageUp": "pageUp", "tui.select.pageDown": "pageDown",
+		}[name] === data);
+		component = factory(ui, h.ctx.ui.theme, { matches }, () => {
+			closes++;
+			component?.dispose?.();
+			resolve();
+		});
+	});
+	return {
+		ui, get opens() { return opens; }, get closes() { return closes; }, get options() { return options; },
+		render(width = 200) { return component.render(width); },
+		input(key) { component.handleInput(key); },
+	};
+}
+
+test("Fable model changes only re-render cached scoped quota, never fetch usage", async (t) => {
+	const h = setup(t);
+	h.models.set(CLAUDE, ["claude-fable-5-2", "claude-opus-5-5"]);
+	h.usageBodies.set(CLAUDE, { five_hour: { utilization: 10 }, seven_day: { utilization: 30 }, limits: [
+		{ kind: "weekly_scoped", percent: 80, scope: { model: { display_name: "Fable" } } },
+	] });
+	h.ctx.model = proxyModel("claude-fable-5-2");
+	await h.emit("session_start");
+	assert.match(h.footer, /5h .* · 7d .* · Fable .*20%/);
+	const count = h.allRequests;
+	const other = { ...h.ctx, model: proxyModel("claude-opus-5-5") };
+	await h.emit("model_select", other);
+	assert.ok(!h.footer.includes("Fable"));
+	await h.emit("model_select");
+	assert.match(h.footer, /Fable .*20%/);
+	assert.equal(h.allRequests, count);
+});
+
+test("quota overlay opens immediately, r forces refresh, esc/q close and shortcut reopens", async (t) => {
+	const h = setup(t);
+	h.ctx.model = proxyModel("claude-fable-5-2");
+	h.models.set(CLAUDE, ["claude-fable-5-2"]);
+	const usage = { five_hour: { utilization: 20 }, seven_day: { utilization: 40 }, limits: [
+		{ kind: "weekly_scoped", percent: 50, scope: { model: { display_name: "Fable" } } },
+	] };
+	h.usageBodies.set(CLAUDE, usage);
+	await h.emit("session_start");
+	const collect = h.client.collect.bind(h.client);
+	const spy = t.mock.method(h.client, "collect", (...args) => collect(...args));
+	const panel = panelHarness(h);
+	const command = h.commands.get("quota").handler("", h.ctx);
+	assert.equal(panel.options.overlay, true);
+	assert.match(panel.render().join("\n"), /Subscription quota.*Loading…/s);
+	await setImmediate();
+	assert.equal(h.notifications.length, 0);
+	assert.match(panel.render().join("\n"), /7-day Fable.*50% used · 50% left/);
+	assert.deepEqual(spy.mock.calls[0].arguments[4], { force: false });
+	h.advance(30_000);
+	usage.limits[0].percent = 95;
+	panel.input("r");
+	assert.match(panel.render().join("\n"), /Refreshing…/);
+	panel.input("r"); // ignored while busy
+	await setImmediate();
+	assert.equal(spy.mock.callCount(), 2);
+	assert.deepEqual(spy.mock.calls[1].arguments[4], { force: true });
+	assert.equal(h.usageRequests.get(CLAUDE), 2);
+	assert.match(h.footer, /Fable .*5%/);
+	const updated = panel.render().find((s) => s.startsWith("Updated"));
+	assert.ok(updated);
+	h.advance(1);
+	panel.input("r");
+	await setImmediate();
+	assert.equal(h.usageRequests.get(CLAUDE), 2, "30s floor suppresses another upstream fetch");
+	assert.equal(panel.render().find((s) => s.startsWith("Updated")), updated, "cached result must not pretend to be newly fetched");
+	panel.ui.terminal.rows = 8;
+	assert.ok(panel.render().length <= 6, "panel fits a short terminal");
+	assert.ok(panel.render(20).every((s) => [...stripVTControlCharacters(s)].length <= 20), "panel fits a narrow terminal");
+	panel.input("pageDown");
+	assert.match(panel.render().join("\n"), /Codex.json/);
+	panel.input("pageUp");
+	assert.match(panel.render().join("\n"), /Claude.json/);
+	panel.input("escape");
+	await command;
+	assert.equal(panel.closes, 1);
+	assert.ok(spy.mock.calls[0].arguments[3].aborted);
+	const shortcut = h.shortcuts.get("ctrl+shift+q").handler(h.ctx);
+	await setImmediate();
+	assert.equal(panel.opens, 2);
+	panel.input("q");
+	await shortcut;
+	assert.equal(panel.closes, 2);
+});
+
+for (const error of ["NO_KEY", "NO_CRED", "network unavailable"]) {
+	test("quota overlay shows " + error + " inline without notifications", async (t) => {
+		const h = setup(t);
+		await h.emit("session_start");
+		t.mock.method(h.client, "collect", async () => { throw new Error(error); });
+		const panel = panelHarness(h);
+		const command = h.commands.get("quota").handler("", h.ctx);
+		await setImmediate();
+		assert.match(panel.render().join("\n"), /Management key not found|No usable OAuth|network unavailable/);
+		assert.equal(h.notifications.length, 0);
+		panel.input("q");
+		await command;
+	});
+}
+
+for (const action of ["q", "shutdown"]) {
+	test("panel " + action + " cancels only its subscriber and rejects late UI publication", async (t) => {
+		const h = setup(t);
+		await h.emit("session_start");
+		const result = await h.client.collect(BASE, "mock-key-not-a-secret");
+		result.snapshot.windows.set(CLAUDE, [{ label: "5h", remainingPct: 1, resetIso: null }]);
+		let resolve;
+		let signal;
+		t.mock.method(h.client, "collect", (_base, _key, _now, callerSignal) => {
+			signal = callerSignal;
+			return new Promise((r) => { resolve = r; }); // even a client ignoring abort cannot publish late
+		});
+		const panel = panelHarness(h);
+		const command = h.commands.get("quota").handler("", h.ctx);
+		await setImmediate();
+		if (action === "shutdown") await h.emit("session_shutdown");
+		else panel.input("q");
+		await command;
+		assert.ok(signal.aborted);
+		const footer = h.footer;
+		const renders = panel.ui.renders;
+		resolve(result);
+		await setImmediate();
+		assert.equal(h.footer, footer);
+		assert.equal(panel.ui.renders, renders);
+		assert.equal(panel.closes, 1);
+	});
+}
+
+test("RPC quota keeps notification fallback even if custom() is present", async (t) => {
+	const h = setup(t);
+	h.ctx.mode = "rpc";
+	h.ctx.ui.custom = () => { throw new Error("TUI-only custom must not run"); };
+	await h.emit("session_start");
+	await h.commands.get("quota").handler("", h.ctx);
+	assert.equal(h.notifications.length, 2);
+	assert.match(h.notifications[1][0], /Subscription quota/);
+});
 
 test("ch-relay registry and trace render the compat quota footer", async (t) => {
 	const h = setup(t);
@@ -234,22 +390,23 @@ test("manual quota stays immediate; failed polls recover silently", async (t) =>
 	assert.equal(h.statuses.length, count + 1);
 });
 
-test("shared model remains pending until a trace selects the real provider without network I/O", async (t) => {
+test("shared model lists all candidates and promotes the traced provider without network I/O", async (t) => {
 	const h = setup(t);
 	h.ctx.model = proxyModel("shared");
 	await h.emit("session_start");
-	assert.equal(h.footer, "claude/codex auth pending (2 accounts)");
+	assert.equal(h.footer, "  Claude.json [claude] - 5h ━━━━━─ 80% │   Codex.json [codex] - 5h ━━━━── 60%");
 	await h.emit("before_provider_request");
 	const requests = h.allRequests;
 	await h.response(CODEX);
-	assert.ok(h.footer.startsWith("codex 5h ━━━━── 60%"));
+	assert.ok(h.footer.startsWith("● Codex.json [codex] - 5h ━━━━── 60%"));
+	assert.ok(h.footer.includes("  Claude.json [claude] - 5h ━━━━━─ 80%"));
 	assert.equal(h.allRequests, requests, "header observation does not block on fetching quota");
 	await h.tick();
-	assert.ok(h.footer.startsWith("codex "), "periodic refresh retains selected auth");
+	assert.ok(h.footer.startsWith("● Codex.json [codex] - "), "periodic refresh retains selected auth");
 	await h.emit("before_provider_request");
-	assert.equal(h.footer, "claude/codex auth pending (2 accounts)");
+	assert.ok(h.footer.startsWith("  Codex.json [codex] - "), "last traced account stays first while request is pending");
 	await h.response(CLAUDE);
-	assert.ok(h.footer.startsWith("claude 5h ━━━━━─ 80%"));
+	assert.ok(h.footer.startsWith("● Claude.json [claude] - 5h ━━━━━─ 80%"));
 });
 
 test("same-provider accounts keep separate quota windows and never choose the first account", async (t) => {
@@ -260,10 +417,11 @@ test("same-provider accounts keep separate quota windows and never choose the fi
 	];
 	h.models.set(SECOND, ["friendly-alias"]);
 	await h.emit("session_start");
-	assert.equal(h.footer, "claude auth pending (2 accounts)");
+	assert.equal(h.footer, "  first.json - 5h ━━━━━─ 80% │   second.json - 5h ━───── 10%");
 	await h.emit("before_provider_request");
 	await h.response(SECOND);
-	assert.ok(h.footer.startsWith("claude:22222222 5h ━───── 10%"));
+	assert.ok(h.footer.startsWith("● second.json - 5h ━───── 10%"));
+	assert.ok(h.footer.includes("  first.json - 5h ━━━━━─ 80%"));
 	await h.tick();
 	assert.ok(h.footer.includes("10%"));
 });
@@ -275,13 +433,13 @@ test("missing, malformed and unsuccessful traces clear previous selection", asyn
 	await h.emit("before_provider_request");
 	await h.response(CODEX);
 	await h.response(null);
-	assert.ok(h.footer.includes("auth pending"));
+	assert.ok(h.footer.includes("  Claude.json") && h.footer.includes("  Codex.json"));
 	await h.response(CODEX);
 	await h.emit("after_provider_response", h.ctx, { status: 200, headers: { "x-cpa-trace-id": "malformed" } });
-	assert.ok(h.footer.includes("auth pending"));
+	assert.ok(h.footer.includes("  Claude.json") && h.footer.includes("  Codex.json"));
 	await h.response(CODEX);
 	await h.response(CLAUDE, h.ctx, 503);
-	assert.ok(h.footer.includes("auth pending"));
+	assert.ok(h.footer.includes("  Claude.json") && h.footer.includes("  Codex.json"));
 });
 
 test("unknown trace auth refreshes credentials but does not fall back to a known account", async (t) => {
@@ -305,7 +463,7 @@ test("refresh completing after a trace uses the latest selected auth", async (t)
 	await h.response(CODEX);
 	release();
 	await setImmediate();
-	assert.ok(h.footer.startsWith("codex "));
+	assert.ok(h.footer.startsWith("● Codex.json [codex] - "));
 });
 
 test("late quota and trace responses cannot update a shut-down session", async (t) => {
@@ -352,10 +510,10 @@ test("credentials without quota adapters still participate in routing ambiguity"
 	];
 	h.models.set(SECOND, ["friendly-alias"]);
 	await h.emit("session_start");
-	assert.equal(h.footer, "claude/custom-provider auth pending (2 accounts)");
+	assert.equal(h.footer, "  claude.json [claude] - 5h ━━━━━─ 80% │   custom.json [custom-provider] - n/a");
 	await h.emit("before_provider_request");
 	await h.response(SECOND);
-	assert.equal(h.footer, "custom-provider n/a");
+	assert.equal(h.footer, "● custom.json [custom-provider] - n/a │   claude.json [claude] - 5h ━━━━━─ 80%");
 });
 
 test("disabled and index-less credentials do not affect discovery", async (t) => {
@@ -422,7 +580,7 @@ test("idle cache warming without a new run preserves the last safely selected au
 	await h.handlers.get("before_provider_request")({ payload: { model: "shared" } }, h.ctx);
 	await h.response(CLAUDE);
 	assert.equal(h.footer, footer);
-	assert.ok(h.footer.startsWith("codex "));
+	assert.ok(h.footer.startsWith("● Codex.json [codex] - "));
 	assert.equal(h.allRequests, requests);
 });
 
@@ -486,7 +644,7 @@ test("discovering a new trace auth does not refetch existing account quota", asy
 	h.models.set(SECOND, ["friendly-alias"]);
 	await h.emit("before_provider_request");
 	await h.response(SECOND);
-	assert.ok(h.footer.startsWith("claude:22222222 n/a"));
+	assert.ok(h.footer.startsWith("● second.json - n/a"));
 	assert.equal(h.usageRequests.get(CLAUDE), 1);
 	assert.equal(h.usageRequests.get(SECOND), undefined);
 	await h.commands.get("quota").handler("", h.ctx);
@@ -533,14 +691,19 @@ test("old quota refresh cannot overwrite a newly selected model", async (t) => {
 	const newCtx = { ...h.ctx, model: proxyModel("shared") };
 	h.pause = undefined;
 	await h.emit("model_select", newCtx);
-	assert.ok(h.footer.includes("auth pending"));
+	assert.ok(h.footer.includes("Claude.json") && h.footer.includes("Codex.json"));
 	release();
 	await setImmediate();
-	assert.ok(h.footer.includes("auth pending"));
+	assert.ok(h.footer.includes("Claude.json") && h.footer.includes("Codex.json"));
 });
 
-test("quota renders as its own line below the built-in footer, without setStatus", async (t) => {
+test("quota renders each account as its own line below the built-in footer, without setStatus", async (t) => {
 	const h = setup(t);
+	h.files = [
+		{ id: "first", name: "first.json", provider: "claude", auth_index: CLAUDE },
+		{ id: "second", name: "second.json", provider: "claude", auth_index: SECOND },
+	];
+	h.models.set(SECOND, ["friendly-alias"]);
 	const builtin = { render: () => ["pwd-line", "stats-line", "other-status"], setAutoCompactEnabled() {}, setSession() {} };
 	let footer;
 	let renders = 0;
@@ -554,14 +717,16 @@ test("quota renders as its own line below the built-in footer, without setStatus
 	assert.equal(h.statuses.length, 0, "shared status line untouched");
 	const lines = footer.render(200);
 	assert.deepEqual(lines.slice(0, 2), ["pwd-line", "stats-line"]);
-	assert.ok(lines[2].startsWith("claude 5h"), lines[2]);
-	assert.equal(lines[3], "other-status");
+	assert.ok(lines[2].startsWith("  first.json - 5h"), lines[2]);
+	assert.ok(lines[3].startsWith("  second.json - 5h"), lines[3]);
+	assert.equal(lines[4], "other-status");
 	assert.ok(renders > 0);
-	assert.ok(footer.render(10)[2].endsWith("…"), "truncated to width");
+	assert.ok(footer.render(10)[2].endsWith("…"), "each account line is truncated to width");
+	assert.ok(footer.render(10)[3].endsWith("…"), "each account line is truncated independently");
 
 	h.ctx.ui.setFooter(() => ({ render: () => ["someone else"] }));
 	await h.commands.get("quota").handler("", h.ctx);
-	assert.ok(h.footer.startsWith("claude "), "falls back to setStatus once replaced");
+	assert.ok(h.footer.startsWith("  first.json - ") && h.footer.includes(" │   second.json - "), "falls back to joined status once replaced");
 
 	await h.emit("session_shutdown");
 	assert.equal(h.footer, undefined);

@@ -5,7 +5,9 @@ A pi extension that allows setups routing subscriptions into pi through CLIProxy
 1. `/quota`: view subscription **5-hour** and **weekly** quota (and other windows) from
    inside pi. Same data path as the EasyCLIProxyAPI panel: call the proxy management API
    `POST /v0/management/api-call`, which proxies usage endpoints (e.g. Anthropic `/api/oauth/usage`,
-   Google `retrieveUserQuotaSummary`) using the stored OAuth credential.
+   Google `retrieveUserQuotaSummary`) using the stored OAuth credential. In TUI mode this is an overlay
+   (`Ctrl+Shift+Q` also opens it): `r` hard refresh, `Esc`/`q` close, arrows/PageUp/PageDown scroll.
+   Non-TUI modes keep notification output; closing cancels only the panel subscriber.
 
 ## Layout conventions
 
@@ -38,10 +40,10 @@ Add this directory's `index.ts` absolute path to the `extensions` array in
 - Resolve the selected credential from HTTP response `X-CPA-TRACE-ID` (`timestamp-auth_index-request_id`) through pi's `after_provider_response` event. Store quota windows by `auth_index`, not by provider.
 - Multiple candidates, missing discovery, or unknown auth must not fall back to the first account. Model/session changes clear trace selection and invalidate late refreshes. Automatic footer updates require the model endpoint to match the configured proxy.
 - Model switches and unknown trace auth refresh local routing only (unknown traces are throttled to once/minute). They must never trigger an upstream quota scan.
-- `createQuotaClient` provides in-process single-flight plus cross-process per-auth cache and minimum five-minute request spacing, including manual commands. Preserve successful windows and mark them stale on failure; respect upstream `Retry-After` and exponential 429 backoff. Management HTTP 429 establishes a shared proxy-level cooldown.
+- `createQuotaClient` provides in-process single-flight plus cross-process per-auth cache and minimum five-minute request spacing, including opening manual commands. Only explicit `r` in the `/quota` overlay may bypass this with a shared 30-second per-auth admission floor; it must still join in-flight work and honor foreign fetch leases and all 429/management cooldowns. Each forced admission restarts the normal five-minute spacing. Preserve successful windows and mark them stale on failure; respect upstream `Retry-After` and exponential 429 backoff. Management HTTP 429 establishes a shared proxy-level cooldown.
 - Shared state lives in `${PI_AGENT_DIR || ~/.pi/agent}/cache/cliproxyapi-quota/<scope hash>/` (directories 0700, files 0600). Persist only normalized quota/manual resets and allowlisted routing metadata — never management/OAuth secrets or raw auth-file content. Proxy URL + management-key hash isolate scopes. Tests use `createQuotaClient({ cacheDir: false })` or an isolated temporary directory.
 - File locks protect short disk transactions, never HTTP calls. Persist admission leases before HTTP. Recover dead-PID locks immediately and stale/corrupt locks after 10 seconds; ownership checks plus immutable lease-journal revisions fence late stale writers and prevent shortening admission/cooldown. Never fetch unlocked on lock contention; filesystem failure falls back to in-memory protection only. Use a shared local filesystem; independent agent directories/keys and external GUI consumers are not coordinated.
-- Lifecycle/connection cancellation must stop later registry/adapter requests, without aborting shared work still needed by another in-process subscriber. Cache/cooldowns survive reload and process restart. Other processes return cached/pending data and poll disk after 10 seconds while a fetch lease is active; a crashed fetch retains five-minute admission spacing even after its 60-second pending lease expires.
+- Lifecycle/connection cancellation must stop later registry/adapter requests, without aborting shared work still needed by another in-process subscriber. Cache/cooldowns survive reload and process restart. Other processes return cached/pending data and poll disk after 10 seconds while a fetch lease is active; a crashed fetch retains five-minute automatic admission spacing even after its 60-second pending lease expires (explicit `r` may use the 30-second exception, never bypassing cooldowns).
 - `npm test` runs offline formatter, routing, lifecycle, throttling, cooldown, cancellation, real multi-process and SIGKILL/stale-writer recovery tests; no credentials or live proxy needed. Do not run live quota smoke tests while debugging a 429.
 
 ## Verification
@@ -52,6 +54,7 @@ Add this directory's `index.ts` absolute path to the `extensions` array in
 
 ## Scope
 
+- Claude `parseClaudeUsage` reads legacy windows and `limits[]` model-scoped weekly entries. `Win.model` stores the lowercase model name (e.g. `fable`); legacy `iguana_necktie` is also Fable and is deduplicated. `/quota` always lists available scoped windows; the footer appends only those matching the current model ID, so Fable models show `5h · 7d · Fable`. Provider/account selection still comes exclusively from routing/trace metadata. Cache validation allows the optional normalized `model` field; older entries remain valid.
 - Compat registry in `index.ts` (`COMPAT_ADAPTERS`): exact entry name `ch-relay` → gateway origin `/_gateway/usage` and `/_gateway/rate-limit-reset-credits` via management api-call. Reuses Codex parsers. Requires updated `/Users/tuananhnguyendang/Me/ch-relay/docker/gateway.py`; gateway owns OAuth refresh. `adapterFor` keeps compat entries separate from OAuth adapters, even if names collide. Persist only credential-free gateway origin as `base_url`, never config API keys/headers.
 - Provider registry in `index.ts` (`ADAPTERS`): one adapter per OAuth provider, each with its own
   endpoint / headers / body and a parser that normalizes to `Win { label, remainingPct, resetIso }`.

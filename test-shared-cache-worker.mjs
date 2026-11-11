@@ -27,7 +27,7 @@ process.on("message", async (message) => {
 			syncBuiltinESMExports();
 		}
 		const client = createQuotaClient({ cacheDir: message.dir, now: () => message.now, random: () => 0 });
-		const { snapshot } = await client.collect(message.base, message.key);
+		const { snapshot } = await client.collect(message.base, message.key, message.now, undefined, { force: message.force });
 		process.send({ done: true, accounts: snapshot.windows.size, pending: snapshot.routingPending });
 		process.disconnect();
 	} catch (error) {

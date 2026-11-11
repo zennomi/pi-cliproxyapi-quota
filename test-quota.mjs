@@ -12,6 +12,7 @@ import {
 	summaryFromWins,
 	formatReset,
 	parseCodexUsage,
+	parseClaudeUsage,
 	parseQuotaSummary,
 	ANTIGRAVITY_UA,
 	parseKiroUsage,
@@ -52,6 +53,54 @@ console.assert(
 	"footer only shows two windows",
 );
 console.assert(summaryFromWins([{ label: "5h", remainingPct: 125, resetIso: "2026-08-19T14:00:00Z" }], now) === "5h ━━━━━━ 100%", "clamped footer quota");
+// Claude's new limits[] exposes Fable even when the legacy key is null.
+const claudeUsage = {
+	five_hour: { utilization: 19, resets_at: "2026-08-19T11:50:00Z" },
+	seven_day: { utilization: 42, resets_at: "2026-08-25T03:00:00Z" },
+	iguana_necktie: null,
+	limits: [
+		{ kind: "session", percent: 19, scope: null },
+		{ kind: "weekly_all", percent: 42, scope: null },
+		{ kind: "weekly_scoped", percent: 0, resets_at: "2026-08-25T03:00:00Z",
+			scope: { model: { id: null, display_name: "Fable" }, surface: null } },
+	],
+};
+const claudeWins = parseClaudeUsage(JSON.stringify(claudeUsage));
+assert.deepEqual(claudeWins, [
+	{ label: "5-hour (session)", remainingPct: 81, resetIso: claudeUsage.five_hour.resets_at },
+	{ label: "7-day (weekly)", remainingPct: 58, resetIso: claudeUsage.seven_day.resets_at },
+	{ label: "7-day Fable", remainingPct: 100, resetIso: claudeUsage.limits[2].resets_at, model: "fable" },
+]);
+assert.match(renderWindows(claudeWins, now)[2], /7-day Fable.*0% used · 100% left · —/);
+const fableFooter = "5h ━━━━━─ 81% ↻2h50m · 7d ━━━─── 58% ↻5d18h · Fable ━━━━━━ 100%";
+for (const model of ["claude-fable-5", "prefix/CLAUDE-FABLE-5-2(high)", { provider: "arbitrary", id: "claude-fable-5-2" }]) {
+	assert.equal(summaryFromWins(claudeWins, now, undefined, model), fableFooter);
+	assert.equal(summaryFromWins([...claudeWins].reverse(), now, undefined, model), fableFooter);
+}
+for (const model of [undefined, "claude-opus-5-5", { provider: "fable", id: "claude-sonnet-5" }]) {
+	assert.equal(summaryFromWins(claudeWins, now, undefined, model), fableFooter.split(" · Fable")[0]);
+}
+const usedFable = [...claudeWins.slice(0, 2), { ...claudeWins[2], remainingPct: 10 }];
+assert.match(summaryFromWins(usedFable, now, mockTheme, "claude-fable-5-2"), new RegExp("<dim>Fable </dim>.*<error>10%</error>.*↻5d18h"));
+const legacyFable = parseClaudeUsage(JSON.stringify({ ...claudeUsage,
+	iguana_necktie: { utilization: 55, resets_at: claudeUsage.seven_day.resets_at },
+	seven_day_cowork: { utilization: 10 },
+}));
+assert.equal(legacyFable.filter((w) => w.model === "fable").length, 1, "legacy + new Fable deduplicate");
+assert.equal(legacyFable[2].remainingPct, 45);
+assert.equal(legacyFable[2].model, "fable", "Fable stays next to overall weekly");
+assert.deepEqual(parseClaudeUsage('{"iguana_necktie":null,"limits":null}'), []);
+for (const percent of [null, "", "  ", "invalid", false, {}, []]) {
+	assert.deepEqual(parseClaudeUsage(JSON.stringify({ limits: [{ ...claudeUsage.limits[2], percent }] })), []);
+}
+for (const entry of [null, {}, { kind: "weekly_scoped", percent: 25, scope: null },
+	{ kind: "weekly_scoped", percent: 25, scope: { model: { display_name: " " } } }]) {
+	assert.deepEqual(parseClaudeUsage(JSON.stringify({ limits: [entry] })), []);
+}
+assert.equal(parseClaudeUsage(JSON.stringify({ limits: [{ ...claudeUsage.limits[2], percent: 125 }] }))[0].remainingPct, 0);
+assert.equal(parseClaudeUsage(JSON.stringify({ limits: [{ ...claudeUsage.limits[2], percent: "50" }] }))[0].remainingPct, 50);
+assert.throws(() => parseClaudeUsage("null"), /Invalid Claude usage/);
+assert.throws(() => parseClaudeUsage("not-json"));
 // Routing comes from credentials' registered IDs, never model family/provider-name guesses.
 const routes = [
 	{ credential: { id: "c1", name: "c1.json", provider: "claude", auth_index: "1111111111111111" }, modelIds: ["claude-opus-5.5", "claude-sonnet-4-6", "friendly-alias"] },
@@ -81,10 +130,39 @@ assert.deepEqual(resolveModelAuth("friendly-alias", sameProvider), { kind: "ambi
 const snapshot = { base: "http://proxy", routes: sameProvider, windows: new Map([
 	["1111111111111111", wins], ["5555555555555555", [{ label: "5h", remainingPct: 12, resetIso: null }]],
 ]) };
-assert.equal(quotaFooter(snapshot, "friendly-alias", null, now), "claude auth pending (2 accounts)");
-assert.ok(quotaFooter(snapshot, "friendly-alias", "5555555555555555", now).startsWith("claude:55555555 5h ━───── 12%"));
+assert.equal(quotaFooter(snapshot, "friendly-alias", null, now), [
+	`  c1.json - ${expectedFooter}`,
+	"  second.json - 5h ━───── 12%",
+].join("\n"));
+assert.equal(quotaFooter(snapshot, "friendly-alias", "5555555555555555", now), [
+	"● second.json - 5h ━───── 12%",
+	`  c1.json - ${expectedFooter}`,
+].join("\n"));
+assert.equal(quotaFooter(snapshot, "friendly-alias", null, now, undefined, "5555555555555555"), [
+	"  second.json - 5h ━───── 12%",
+	`  c1.json - ${expectedFooter}`,
+].join("\n"));
+const mixedSnapshot = {
+	...snapshot,
+	routes: [
+		{ credential: { ...routes[0].credential, email: "claude@example.com" }, modelIds: ["mixed"] },
+		{ credential: { ...routes[1].credential, email: "gravity@example.com" }, modelIds: ["mixed"] },
+	],
+};
+assert.equal(quotaFooter(mixedSnapshot, "mixed", null, now), [
+	`  claude@example.com [claude] - ${expectedFooter}`,
+	"  gravity@example.com [antigravity] - n/a",
+].join("\n"));
 assert.equal(quotaFooter(snapshot, "gpt-5.6-terra", null, now), "codex n/a", "never fall back when selected quota is missing");
 assert.equal(quotaFooter(snapshot, "friendly-alias", "deleted-auth", now), "auth unknown");
+
+const fableSnapshot = { ...snapshot, routes: [
+	{ ...sameProvider[0], modelIds: ["claude-fable-5-2"] },
+	{ ...sameProvider.at(-1), modelIds: ["claude-fable-5-2"] },
+], windows: new Map([["1111111111111111", claudeWins], ["5555555555555555", usedFable]]) };
+const accountsFable = quotaFooter(fableSnapshot, "claude-fable-5-2", "5555555555555555", now);
+assert.match(accountsFable.split("\n")[0], /^● second.json.*Fable ━───── 10%/);
+assert.match(accountsFable.split("\n")[1], /Fable ━━━━━━ 100%/);
 
 const trace = "20261008235959-2222222222222222-0199b012-3456-7890-abcd-0123456789ab";
 assert.equal(authIndexFromHeaders({ "X-CPA-TRACE-ID": trace }), "2222222222222222");

@@ -139,7 +139,7 @@ function setup(t) {
 		else if (h.usageGate) await h.usageGate;
 		if (h.mode === "outer429") return Response.json({}, { status: 429, headers: { "Retry-After": h.retryAfterByAuth.get(request.authIndex) ?? h.retryAfter } });
 		return Response.json({ status_code: h.mode === "429" ? 429 : 200, header: { "Retry-After": h.retryAfter },
-			body: JSON.stringify({ five_hour: { utilization: h.used } }) });
+			body: JSON.stringify({ five_hour: { utilization: h.used }, ...h.usageExtra }) });
 	});
 	return h;
 }
@@ -192,6 +192,104 @@ async function mockServer(t) {
 		get resets() { return h.resets; }, set gate(value) { h.gate = value; },
 		base: `http://127.0.0.1:${server.address().port}` };
 }
+
+test("model-scoped windows survive a fresh client and the disk allowlist", async (t) => {
+	const h = setup(t);
+	h.usageExtra = { seven_day: { utilization: 15 }, limits: [
+		{ kind: "weekly_scoped", percent: 60, scope: { model: { display_name: "Fable" } } },
+	] };
+	await h.collect(h.client());
+	const result = await h.collect(h.client());
+	assert.equal(result.snapshot.windows.get(C)[2].model, "fable");
+	assert.equal(result.snapshot.windows.get(C)[2].remainingPct, 40);
+	assert.match(quotaFooter(result.snapshot, "claude-fable-5-2", C), /Fable .*40%/);
+	assert.match(result.blocks.join("\n"), /7-day Fable/);
+	assert.equal(h.usage, 1);
+});
+
+test("forced admission floor and active lease are shared between independent clients", async (t) => {
+	const h = setup(t);
+	const force = () => h.client().collect(BASE, KEY, h.now, undefined, { force: true });
+	await h.collect(h.client());
+	h.advance(29_999);
+	await force();
+	assert.equal(h.usage, 1);
+	h.advance(1);
+	const gate = deferred();
+	h.usageGate = gate.promise;
+	h.started = deferred();
+	const pending = force();
+	await h.started.promise;
+	h.advance(30_000);
+	const other = await force();
+	assert.equal(h.usage, 2, "force still respects the 60s foreign lease");
+	assert.equal(other.snapshot.statuses.get(C).pendingElsewhere, true);
+	assert.equal(other.snapshot.windows.get(C)[0].remainingPct, 80);
+	gate.resolve();
+	await pending;
+	await h.collect(h.client());
+	assert.equal(h.usage, 2, "normal collect observes the forced lease's five-minute spacing");
+});
+
+for (const mode of ["429", "outer429", "list429"]) {
+	test("force from a fresh client cannot bypass shared " + mode + " cooldown", async (t) => {
+		const h = setup(t);
+		await h.collect(h.client());
+		h.advance(TTL);
+		h.mode = mode;
+		const force = () => h.client().collect(BASE, KEY, h.now, undefined, { force: true });
+		if (mode === "list429") await assert.rejects(force(), /management HTTP 429/);
+		else await force();
+		const counts = [h.usage, h.list, h.models, h.resets];
+		h.advance(30_000);
+		await force(); // cached routes survive, but no HTTP is admitted
+		assert.deepEqual([h.usage, h.list, h.models, h.resets], counts);
+	});
+}
+
+test("late forced completion cannot overwrite a newer forced lease", async (t) => {
+	const h = setup(t);
+	await h.collect(h.client());
+	h.advance(30_000);
+	const gate = deferred();
+	h.usageGate = gate.promise;
+	h.started = deferred();
+	const force = () => h.client().collect(BASE, KEY, h.now, undefined, { force: true });
+	const slow = force();
+	await h.started.promise;
+	h.advance(61_000);
+	h.usageGate = undefined;
+	h.used = 50;
+	await force();
+	h.used = 90;
+	gate.resolve();
+	await slow;
+	assert.equal((await h.collect(h.client())).snapshot.windows.get(C)[0].remainingPct, 50);
+	assert.equal(h.usage, 3);
+});
+
+test("real force callers share the 30s floor across process restarts", { timeout: 15_000 }, async (t) => {
+	const dir = temp(t);
+	const server = await mockServer(t);
+	await createQuotaClient({ cacheDir: dir, now: () => NOW }).collect(server.base, KEY);
+	const run = async (now, count) => {
+		const children = await Promise.all(Array.from({ length: count }, () => child(t)));
+		const messages = children.map(({ proc }) => once(proc, "message"));
+		for (const { proc } of children) proc.send({ dir, base: server.base, key: KEY, now, force: true });
+		for (const [message] of await Promise.all(messages)) assert.equal(message.done, true, message.error);
+		for (const c of children) assert.deepEqual(await c.exited, [0, null], c.stderr());
+	};
+	await run(NOW + 29_999, 1);
+	assert.equal(server.usage, 1);
+	await run(NOW + 30_000, 5);
+	assert.equal(server.usage, 2);
+	assert.equal(server.resets, 2);
+	await run(NOW + 59_999, 1);
+	assert.equal(server.usage, 2);
+	await run(NOW + 60_000, 1);
+	assert.equal(server.usage, 3);
+	assert.equal(server.resets, 3);
+});
 
 // Lock recovery and cleanup are tested separately from HTTP admission.
 test("fresh live lock is busy; release cannot remove a different owner's token", async (t) => {

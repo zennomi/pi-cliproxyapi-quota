@@ -30,7 +30,7 @@ function setup(t, two = false) {
 		mode: "success", retryAfter: undefined, retryAfterByAuth: new Map(), listMode: "success", quotaGate: undefined, quotaGates: new Map(), listGate: undefined,
 		get now() { return now; },
 		advance(ms) { now += ms; },
-		async collect(signal) { return h.client.collect(BASE, KEY, now, signal); },
+		async collect(signal, opts) { return h.client.collect(BASE, KEY, now, signal, opts); },
 	};
 	if (two) h.files.push({ id: "o", name: "codex.json", provider: "codex", auth_index: O });
 	t.mock.method(globalThis, "fetch", async (input, options) => {
@@ -68,6 +68,99 @@ function setup(t, two = false) {
 	});
 	return h;
 }
+
+test("force bypasses the five-minute cache only after a 30s admission floor", async (t) => {
+	const h = setup(t);
+	const force = () => h.collect(undefined, { force: true });
+	await h.collect();
+	h.advance(29_999);
+	await force();
+	assert.equal(h.usage.get(C), 1);
+	h.advance(1);
+	await force();
+	assert.equal(h.usage.get(C), 2);
+	assert.equal(h.list, 1, "force preserves the one-minute registry throttle");
+	await force();
+	assert.equal(h.usage.get(C), 2);
+	h.advance(30_000);
+	await force();
+	assert.equal(h.usage.get(C), 3);
+	assert.equal(h.list, 2, "force refreshes routing once its throttle expires");
+	h.advance(TTL - 1);
+	await h.collect();
+	assert.equal(h.usage.get(C), 3, "automatic refresh waits a full TTL after force");
+	h.advance(1);
+	await h.collect();
+	assert.equal(h.usage.get(C), 4);
+});
+
+test("concurrent force and normal refresh join the same account flight", async (t) => {
+	const h = setup(t);
+	await h.collect();
+	h.advance(30_000);
+	const gate = deferred();
+	h.quotaGate = gate.promise;
+	const force = h.collect(undefined, { force: true });
+	await setImmediate();
+	const normal = h.collect();
+	const duplicate = h.collect(undefined, { force: true });
+	await setImmediate();
+	assert.equal(h.usage.get(C), 2);
+	gate.resolve();
+	await Promise.all([force, normal, duplicate]);
+	assert.equal(h.peak, 1);
+});
+
+for (const retryAfter of ["3600", "invalid", new Date(Date.parse("2026-10-08T12:00:00Z") + 900_000).toUTCString()]) {
+	test("force respects upstream cooldown: " + retryAfter, async (t) => {
+		const h = setup(t);
+		await h.collect();
+		h.advance(30_000);
+		h.mode = "429";
+		h.retryAfter = retryAfter;
+		const limited = await h.collect(undefined, { force: true });
+		const retryAt = limited.snapshot.statuses.get(C).retryAt;
+		assert.ok(limited.snapshot.statuses.get(C).stale);
+		h.advance(retryAt - h.now - 1);
+		await h.collect(undefined, { force: true });
+		assert.equal(h.usage.get(C), 2);
+		h.advance(1);
+		h.mode = "success";
+		await h.collect(undefined, { force: true });
+		assert.equal(h.usage.get(C), 3);
+	});
+}
+
+test("force cannot bypass proxy-level cooldown or start another account", async (t) => {
+	const h = setup(t, true);
+	h.mode = "outer429";
+	await h.collect(undefined, { force: true });
+	h.advance(60_000);
+	const calls = [h.list, h.models, ...h.usage.values()];
+	await h.collect(undefined, { force: true });
+	assert.deepEqual([h.list, h.models, ...h.usage.values()], calls);
+	assert.equal(h.usage.get(O), undefined);
+});
+
+test("cancelling a force subscriber leaves a normal subscriber's fetch alive", async (t) => {
+	const h = setup(t);
+	await h.collect();
+	h.advance(30_000);
+	const gate = deferred();
+	h.quotaGate = gate.promise;
+	const controller = new AbortController();
+	const force = h.collect(controller.signal, { force: true });
+	await setImmediate();
+	const normal = h.collect();
+	await setImmediate();
+	const rejected = assert.rejects(force, { name: "AbortError" });
+	controller.abort();
+	await rejected;
+	assert.equal(h.requestSignal.aborted, false);
+	gate.resolve();
+	await normal;
+	assert.equal(h.usage.get(C), 2);
+});
 
 test("five concurrent collections coalesce discovery and same-account quota", async (t) => {
 	const h = setup(t);

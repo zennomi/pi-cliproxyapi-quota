@@ -227,6 +227,8 @@ export interface Win {
 	resetIso: string | null;
 	tag?: string;
 	group?: string;
+	/** Lowercase model scope for provider-specific windows (e.g. Claude Fable). */
+	model?: string;
 	used?: number | null;
 	limit?: number | null;
 	unit?: string;
@@ -333,6 +335,40 @@ const CLAUDE_WINDOWS: Array<[string, string]> = [
 	["seven_day_cowork", "7-day Cowork"],
 	["iguana_necktie", "7-day Fable"],
 ];
+
+/** Claude legacy windows plus the model-scoped limits returned by newer usage APIs. */
+export function parseClaudeUsage(body: string): Win[] {
+	const usage = record(JSON.parse(body));
+	if (!usage) throw new Error("Invalid Claude usage response");
+	const wins: Win[] = [];
+	for (const [k, label] of CLAUDE_WINDOWS) {
+		const w = record(usage[k]);
+		const u = toNum(w?.utilization);
+		if (!w || u === null) continue;
+		wins.push({ label, remainingPct: Math.max(0, 100 - u), resetIso: firstIso(w.resets_at),
+			...(k === "iguana_necktie" ? { model: "fable" } : {}) });
+	}
+	for (const value of Array.isArray(usage.limits) ? usage.limits : []) {
+		const limit = record(value);
+		if (limit?.kind !== "weekly_scoped") continue;
+		const name = record(record(limit.scope)?.model)?.display_name;
+		const percent = toNum(limit.percent);
+		if (typeof name !== "string" || !name.trim() || percent === null || (typeof limit.percent === "string" && !limit.percent.trim())) continue;
+		const model = name.trim().toLowerCase();
+		if (wins.some((w) => w.model === model)) continue;
+		wins.push({ label: `7-day ${name.trim()}`, remainingPct: Math.max(0, 100 - percent),
+			resetIso: firstIso(limit.resets_at), model });
+	}
+	// Keep the Fable-specific weekly immediately beside the overall weekly in /quota.
+	const fable = wins.findIndex((w) => w.model === "fable");
+	if (fable >= 0) {
+		const [window] = wins.splice(fable, 1);
+		const weekly = wins.findIndex((w) => w.label === "7-day (weekly)");
+		wins.splice(weekly >= 0 ? weekly + 1 : wins.length, 0, window);
+	}
+	return wins;
+}
+
 const claudeAdapter: Adapter = {
 	verified: true,
 	async fetchManualResets(base, key, cred, signal) {
@@ -350,16 +386,7 @@ const claudeAdapter: Adapter = {
 			url: "https://api.anthropic.com/api/oauth/usage",
 			header: { ...BEARER, "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20" },
 		}, signal);
-		const usage = JSON.parse(body) as Record<string, { utilization?: unknown; resets_at?: unknown } | null>;
-		const wins: Win[] = [];
-		for (const [k, label] of CLAUDE_WINDOWS) {
-			const w = usage[k];
-			if (!w || typeof w !== "object") continue;
-			const u = toNum((w as { utilization?: unknown }).utilization);
-			if (u === null) continue;
-			wins.push({ label, remainingPct: Math.max(0, 100 - u), resetIso: firstIso((w as { resets_at?: unknown }).resets_at) });
-		}
-		return wins;
+		return parseClaudeUsage(body);
 	},
 };
 
@@ -819,17 +846,13 @@ async function discoverCredentialModels(base: string, key: string, creds: AuthFi
 	}));
 }
 
-/** Resolve candidates from the runtime registry, or the exact last selected auth from a trace. */
-export function resolveModelAuth(model: ModelHint, routes: CredentialModels[], selectedAuthIndex?: string | null): AuthResolution {
+/** Resolve the enabled credentials advertised for a model by the runtime registry. */
+function modelCandidates(model: ModelHint, routes: CredentialModels[]): CredentialModels[] | { unknown: "model" | "registry" } {
 	const enabled = routes.filter(({ credential }) => !credential.disabled);
-	if (selectedAuthIndex) {
-		const hit = enabled.find(({ credential }) => credential.auth_index === selectedAuthIndex);
-		return hit ? { kind: "auth", credential: hit.credential, source: "trace" } : { kind: "unknown", reason: "auth" };
-	}
 	const id = (typeof model === "string" ? model : model?.id)?.trim();
-	if (!id) return { kind: "unknown", reason: "model" };
+	if (!id) return { unknown: "model" };
 	// Never treat a missing/failed registry response as proof that only one auth supports the model.
-	if (enabled.some((route) => route.modelIds === null)) return { kind: "unknown", reason: "registry" };
+	if (enabled.some((route) => route.modelIds === null)) return { unknown: "registry" };
 	const matching = (name: string) => enabled.filter((route) => route.modelIds?.includes(name));
 	let candidates = matching(id);
 	if (!candidates.length) candidates = matching(id.toLowerCase());
@@ -838,28 +861,66 @@ export function resolveModelAuth(model: ModelHint, routes: CredentialModels[], s
 		const plain = id.replace(/\([^()]*\)$/, "").trim();
 		if (plain !== id) candidates = matching(plain);
 	}
-	if (!candidates.length) return { kind: "unknown", reason: "model" };
+	return candidates.length ? candidates : { unknown: "model" };
+}
+
+/** Resolve candidates from the runtime registry, or the exact last selected auth from a trace. */
+export function resolveModelAuth(model: ModelHint, routes: CredentialModels[], selectedAuthIndex?: string | null): AuthResolution {
+	const enabled = routes.filter(({ credential }) => !credential.disabled);
+	if (selectedAuthIndex) {
+		const hit = enabled.find(({ credential }) => credential.auth_index === selectedAuthIndex);
+		return hit ? { kind: "auth", credential: hit.credential, source: "trace" } : { kind: "unknown", reason: "auth" };
+	}
+	const candidates = modelCandidates(model, routes);
+	if (!Array.isArray(candidates)) return { kind: "unknown", reason: candidates.unknown };
 	if (candidates.length === 1) return { kind: "auth", credential: candidates[0].credential, source: "registry" };
 	return { kind: "ambiguous", providers: [...new Set(candidates.map(({ credential }) => providerKey(credential)))], count: candidates.length };
 }
 
-export function quotaFooter(snapshot: QuotaSnapshot, model: ModelHint, selectedAuthIndex?: string | null, now = Date.now(), theme?: FooterTheme): string {
+function accountLine(snapshot: QuotaSnapshot, cred: AuthFile, model: ModelHint, now: number, theme?: FooterTheme): string {
+	const summary = summaryFromWins(snapshot.windows.get(cred.auth_index as string) ?? [], now, theme, model);
+	const status = snapshot.statuses?.get(cred.auth_index as string);
+	const note = status?.error ? ` · ${status.stale ? "stale; " : ""}${status.rateLimited ? "rate limited" : "refresh failed"}${status.retryAt ? compactReset(new Date(status.retryAt).toISOString(), now) : ""}` : "";
+	return `${summary}${note}`;
+}
+
+export function quotaFooter(
+	snapshot: QuotaSnapshot, model: ModelHint, selectedAuthIndex?: string | null,
+	now = Date.now(), theme?: FooterTheme, orderHint?: string | null,
+): string {
 	const resolved = resolveModelAuth(model, snapshot.routes, selectedAuthIndex);
 	if (resolved.kind === "unknown") return resolved.reason === "registry" ? "routing unavailable" : "auth unknown";
-	if (resolved.kind === "ambiguous") {
-		return `${resolved.providers.join("/")} auth pending (${resolved.count} accounts)`;
+
+	const candidates = modelCandidates(model, snapshot.routes);
+	const selectedCandidate = Array.isArray(candidates) && selectedAuthIndex
+		? candidates.find(({ credential }) => credential.auth_index === selectedAuthIndex)
+		: undefined;
+	if (Array.isArray(candidates) && candidates.length > 1 && (!selectedAuthIndex || selectedCandidate)) {
+		const providers = new Set(candidates.map(({ credential }) => providerKey(credential)));
+		const ordered = [...candidates];
+		const priority = selectedAuthIndex || orderHint;
+		if (priority) {
+			const index = ordered.findIndex(({ credential }) => credential.auth_index === priority);
+			if (index > 0) ordered.unshift(...ordered.splice(index, 1));
+		}
+		return ordered.map(({ credential }) => {
+			const marker = credential.auth_index === selectedAuthIndex ? "● " : "  ";
+			const name = credential.email || credential.label || credential.name;
+			const provider = providers.size > 1 ? ` [${providerKey(credential)}]` : "";
+			return `${marker}${name}${provider} - ${accountLine(snapshot, credential, model, now, theme)}`;
+		}).join("\n");
 	}
+
+	if (resolved.kind === "ambiguous") return "auth unknown";
 	const cred = resolved.credential;
 	const pk = providerKey(cred);
 	const multiple = snapshot.routes.filter((r) => providerKey(r.credential) === pk && !r.credential.disabled).length > 1;
 	const label = multiple ? `${pk}:${cred.auth_index?.slice(0, 8)}` : pk;
-	const summary = summaryFromWins(snapshot.windows.get(cred.auth_index as string) ?? [], now, theme, model);
-	const status = snapshot.statuses?.get(cred.auth_index as string);
-	const note = status?.error ? ` · ${status.stale ? "stale; " : ""}${status.rateLimited ? "rate limited" : "refresh failed"}${status.retryAt ? compactReset(new Date(status.retryAt).toISOString(), now) : ""}` : "";
-	return `${label} ${summary}${note}`;
+	return `${label} ${accountLine(snapshot, cred, model, now, theme)}`;
 }
 
 const QUOTA_TTL_MS = 5 * 60_000;
+const FORCE_FLOOR_MS = 30_000;
 const ROUTING_THROTTLE_MS = 60_000;
 const MAX_BACKOFF_MS = 60 * 60_000;
 
@@ -1120,7 +1181,7 @@ function validDiskAccount(disk?: DiskAccount): disk is DiskAccount {
 	if (disk.windows !== undefined && (!Array.isArray(disk.windows) || !disk.windows.every((w) =>
 		w && typeof w.label === "string" && (w.remainingPct === null || finiteNumber(w.remainingPct)) &&
 		(w.resetIso === null || typeof w.resetIso === "string") &&
-		["tag", "group", "unit"].every((field) => w[field as keyof Win] === undefined || typeof w[field as keyof Win] === "string") &&
+		["tag", "group", "unit", "model"].every((field) => w[field as keyof Win] === undefined || typeof w[field as keyof Win] === "string") &&
 		["used", "limit"].every((field) => w[field as keyof Win] == null || finiteNumber(w[field as keyof Win]))))) return false;
 	if (disk.manualResets !== undefined && (!record(disk.manualResets) ||
 		(disk.manualResets.availableCount !== null && !finiteNumber(disk.manualResets.availableCount)) ||
@@ -1215,7 +1276,7 @@ function joinFlight<T>(flight: Flight<T>, signal?: AbortSignal): Promise<T> {
 export interface QuotaClient {
 	routing(base: string, key: string, signal?: AbortSignal, refresh?: boolean): Promise<CredentialModels[]>;
 	snapshot(base: string, key: string, routes: CredentialModels[]): QuotaSnapshot;
-	collect(base: string, key: string, now?: number, signal?: AbortSignal): Promise<{ blocks: string[]; snapshot: QuotaSnapshot }>;
+	collect(base: string, key: string, now?: number, signal?: AbortSignal, opts?: { force?: boolean }): Promise<{ blocks: string[]; snapshot: QuotaSnapshot }>;
 }
 
 /** Separate local routing discovery from rate-limited upstream quota, with per-auth admission control. */
@@ -1394,7 +1455,7 @@ export function createQuotaClient(
 			routingPending: (cache.routeFetchingUntil ?? 0) > clock() };
 	}
 
-	async function quota(base: string, key: string, cred: AuthFile, signal?: AbortSignal): Promise<void> {
+	async function quota(base: string, key: string, cred: AuthFile, signal?: AbortSignal, opts: { force?: boolean } = {}): Promise<void> {
 		signal?.throwIfAborted();
 		const cache = cacheFor(base, key);
 		const index = cred.auth_index as string;
@@ -1406,9 +1467,18 @@ export function createQuotaClient(
 		const file = accountFile(index);
 		mergeManagement(cache, store.read<DiskManagement>(scope, "management"));
 		mergeAccount(entry, store.read<DiskAccount>(scope, file));
-		if (cache.managementUntil > clock() || entry.retryAt > clock()) return;
-		const controller = new AbortController();
 		const account = entry;
+		const blocked = () => {
+			const now = clock();
+			// Non-429 retryAt is the durable admission time + TTL, shared across processes.
+			// Force shortens only that spacing, never a live lease or a cooldown.
+			return cache.managementUntil > now || (account.fetchingUntil ?? 0) > now ||
+				(opts.force && !account.rateLimited
+					? now < account.retryAt - QUOTA_TTL_MS + FORCE_FLOOR_MS
+					: account.retryAt > now);
+		};
+		if (blocked()) return;
+		const controller = new AbortController();
 		const owner = randomUUID();
 		let admitted = false;
 		const flight: Flight<void> = { controller, users: 0, promise: Promise.resolve().then(async () => {
@@ -1418,7 +1488,7 @@ export function createQuotaClient(
 				const decision = await store.transaction(scope, file, (read, write) => {
 					mergeManagement(cache, read<DiskManagement>("management"));
 					mergeAccount(account, read<DiskAccount>(file));
-					if (cache.managementUntil > clock() || account.retryAt > clock()) return false;
+					if (blocked()) return false;
 					const lease = reservation();
 					write(file, lease); // Durable admission BEFORE HTTP; crash still counts toward spacing.
 					mergeAccount(account, lease);
@@ -1429,7 +1499,7 @@ export function createQuotaClient(
 					return;
 				}
 				if (decision.kind === "disabled") {
-					if (cache.managementUntil > clock() || account.retryAt > clock()) return;
+					if (blocked()) return;
 					mergeAccount(account, reservation());
 				}
 				admitted = true;
@@ -1490,9 +1560,9 @@ export function createQuotaClient(
 		return joinFlight(flight, signal);
 	}
 
-	async function collect(base: string, key: string, now = clock(), signal?: AbortSignal): Promise<{ blocks: string[]; snapshot: QuotaSnapshot }> {
+	async function collect(base: string, key: string, now = clock(), signal?: AbortSignal, opts: { force?: boolean } = {}): Promise<{ blocks: string[]; snapshot: QuotaSnapshot }> {
 		base = base.replace(/\/$/, "");
-		const routes = await routing(base, key, signal);
+		const routes = await routing(base, key, signal, opts.force);
 		signal?.throwIfAborted();
 		const known = routes.map((r) => r.credential).filter((c) => adapterFor(c))
 			.sort((a, b) => (providerKey(a) === "claude" ? 0 : 1) - (providerKey(b) === "claude" ? 0 : 1));
@@ -1503,7 +1573,7 @@ export function createQuotaClient(
 		}
 		for (const cred of known) {
 			signal?.throwIfAborted();
-			await quota(base, key, cred, signal);
+			await quota(base, key, cred, signal, opts);
 		}
 		signal?.throwIfAborted();
 		const result = snapshot(base, key, routes);
@@ -1705,7 +1775,7 @@ export function selectBestGroup(
 	return groups[0];
 }
 
-/** Compact one-line remaining-quota meter: 5h, then weekly/7d, then other windows. */
+/** Two general meters (5h/7d), followed by any windows scoped to the selected model. */
 export function summaryFromWins(
 	wins: Win[],
 	now = Date.now(),
@@ -1717,6 +1787,7 @@ export function summaryFromWins(
 
 	const sorted = candidateWins
 		.map((w, index) => ({ w, index }))
+		.filter(({ w }) => !w.model)
 		.sort((a, b) => footerWindowRank(a.w.label) - footerWindowRank(b.w.label) || a.index - b.index);
 
 	const footerWins: Array<{ w: Win; index: number }> = [];
@@ -1738,6 +1809,11 @@ export function summaryFromWins(
 		}
 	}
 
+	const modelId = (typeof model === "string" ? model : model?.id ?? "").toLowerCase();
+	for (const [index, w] of candidateWins.entries()) {
+		if (w.model && modelId.includes(w.model.toLowerCase())) footerWins.push({ w, index });
+	}
+
 	const parts: string[] = [];
 	for (const { w } of footerWins) {
 		if (w.remainingPct === null) continue;
@@ -1745,7 +1821,7 @@ export function summaryFromWins(
 		const rounded = Math.round(remaining);
 		const reset = rounded >= 100 ? "" : compactReset(w.resetIso, now);
 		const tagStr = w.tag ? ` (${w.tag})` : "";
-		const label = shortTag(w.label);
+		const label = w.model ? w.model[0].toUpperCase() + w.model.slice(1) : shortTag(w.label);
 		const value = `${rounded}%`;
 		const styledLabel = theme ? theme.fg("dim", `${label} `) : `${label} `;
 		const styledValue = theme ? theme.fg(footerTone(remaining), value) : value;
@@ -1850,7 +1926,8 @@ function installFooterLine(ui: ExtensionContext["ui"]): FooterLine | undefined {
 				if (line === undefined) return lines;
 				// Built-in footer: [pwd, stats, ...extension statuses]; quota goes right after stats.
 				const at = Math.min(2, lines.length);
-				return [...lines.slice(0, at), truncateStyled(line, width), ...lines.slice(at)];
+				const quotaLines = line.split("\n").map((value) => truncateStyled(value, width));
+				return [...lines.slice(0, at), ...quotaLines, ...lines.slice(at)];
 			},
 			invalidate() {
 				builtin.invalidate?.();
@@ -1896,10 +1973,12 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 	let routingRevision = 0;
 	let snapshot: QuotaSnapshot | undefined;
 	let selectedAuthIndex: string | null = null;
+	let lastTracedAuthIndex: string | null = null;
 	let requestRun: { revision: number; modelKey: string; scope: string } | undefined;
 	let pendingRequest: typeof requestRun;
 	let footerLine: FooterLine | undefined;
 	let statusShown = false;
+	let closePanel: (() => void) | undefined;
 
 	const modelKey = (model: ProxyModel | undefined) => JSON.stringify([model?.provider, model?.id, model?.baseUrl]);
 	const currentScope = () => scopeId(resolveBaseUrl(), resolveManagementKey() ?? "");
@@ -1917,6 +1996,7 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 			connectionScope = scope;
 			snapshot = undefined;
 			selectedAuthIndex = null;
+			lastTracedAuthIndex = null;
 		}
 		return { base, key, scope };
 	}
@@ -1929,7 +2009,7 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 		}
 		// Fallback: shared extension status line (no built-in footer to extend).
 		footerLine = undefined;
-		ctx.ui.setStatus(QUOTA_KEY, text);
+		ctx.ui.setStatus(QUOTA_KEY, text?.split("\n").join(" │ "));
 		statusShown = text !== undefined;
 	}
 
@@ -1940,9 +2020,9 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 			return;
 		}
 		const footer = snapshot && snapshotScope === currentScope()
-			? quotaFooter(snapshot, ctx.model, selectedAuthIndex, Date.now(), ctx.ui.theme)
+			? quotaFooter(snapshot, ctx.model, selectedAuthIndex, Date.now(), ctx.ui.theme, lastTracedAuthIndex)
 			: "routing unavailable";
-		showFooter(ctx, ctx.ui.theme.fg("dim", footer));
+		showFooter(ctx, footer.split("\n").map((line) => ctx.ui.theme.fg("dim", line)).join("\n"));
 	}
 
 	async function refreshRouting(ctx: ExtensionContext, refresh = false): Promise<void> {
@@ -1964,8 +2044,125 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 		}
 	}
 
+	function applyResult(ctx: ExtensionContext, result: QuotaSnapshot, session: AbortController, scope: string): boolean {
+		if (!active || session !== lifecycle || scope !== currentScope()) return false;
+		snapshot = result;
+		snapshotScope = scope;
+		// Quota is account-scoped; render using the latest selected model, not the caller's old one.
+		updateFooter(activeCtx ?? ctx);
+		return true;
+	}
+
+	function quotaError(ctx: ExtensionContext, err: unknown): string {
+		const msg = err instanceof Error ? err.message : String(err);
+		if (msg === "NO_CRED") {
+			snapshot = undefined;
+			selectedAuthIndex = null;
+			lastTracedAuthIndex = null;
+			updateFooter(activeCtx ?? ctx);
+		} else if (!snapshot) updateFooter(activeCtx ?? ctx);
+		if (msg === "NO_KEY") return 'Management key not found. Set CLIPROXYAPI_MANAGEMENT_KEY or configure ~/.pi/agent/cliproxyapi-quota.json / EasyCLIProxyAPI.';
+		if (msg === "NO_CRED") return "No usable OAuth credential found (claude / codex / antigravity / gemini / kimi / xai / kiro).";
+		return `Failed to fetch quota: ${msg}`;
+	}
+
+	async function showQuotaPanel(ctx: ExtensionContext): Promise<void> {
+		if (closePanel) return; // Do not stack another panel on a repeated shortcut.
+		const session = lifecycle;
+		const subscriber = new AbortController();
+		let cleanup = () => subscriber.abort();
+		try {
+			await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
+				let closed = false;
+				let busy = false;
+				let blocks: string[] = [];
+				let status = "Loading…";
+				let statusColor: FooterColor = "dim";
+				let offset = 0;
+				const pageSize = () => Math.max(1, (tui.terminal.rows || 24) - 5);
+				const dispose = () => {
+					closed = true;
+					subscriber.abort();
+					session.signal.removeEventListener("abort", close);
+					if (closePanel === close) closePanel = undefined;
+				};
+				const close = () => {
+					if (closed) return;
+					dispose();
+					done();
+				};
+				closePanel = close;
+				cleanup = dispose;
+				session.signal.addEventListener("abort", close, { once: true });
+				const refresh = async (force = false) => {
+					if (closed || busy) return;
+					busy = true;
+					status = force ? "Refreshing…" : "Loading…";
+					statusColor = "dim";
+					tui.requestRender();
+					let signal: AbortSignal | undefined;
+					try {
+						const { base, key, scope } = connection();
+						signal = AbortSignal.any([subscriber.signal, session.signal, connectionLifetime.signal]);
+						const result = await client.collect(base, key, Date.now(), signal, { force });
+						signal.throwIfAborted();
+						if (closed || !applyResult(ctx, result.snapshot, session, scope)) { close(); return; }
+						blocks = result.blocks;
+						const statuses = [...(result.snapshot.statuses?.values() ?? [])];
+						const checkedAt = Math.max(0, ...statuses.map((s) => s.checkedAt ?? 0));
+						// Show actual data freshness, not the time a cached/no-op refresh returned.
+						status = checkedAt ? `Updated ${new Date(checkedAt).toLocaleTimeString()}` : "Quota refresh pending";
+						if (statuses.some((s) => s.error || s.manualResetsError)) {
+							status += " · refresh failed / cooldown (see details)";
+							statusColor = "warning";
+						} else if (result.snapshot.routingPending || statuses.some((s) => s.pendingElsewhere)) {
+							status += " · refresh pending in another session";
+						} else {
+							status += " · cached results allowed; r respects 30s / 429 cooldown";
+						}
+					} catch (err) {
+						if (closed || signal?.aborted || session !== lifecycle || !active) { close(); return; }
+						status = quotaError(ctx, err);
+						statusColor = "error";
+					} finally {
+						busy = false;
+						if (!closed) tui.requestRender();
+					}
+				};
+				// Let custom() install the component before asynchronous work can close it.
+				queueMicrotask(() => { if (session.signal.aborted) close(); else void refresh(); });
+				return {
+					render(width: number): string[] {
+						const height = pageSize();
+						offset = Math.max(0, Math.min(offset, blocks.length - height));
+						const scroll = blocks.length > height ? ` · ↑↓/PgUp/PgDn scroll (${offset + 1}-${Math.min(offset + height, blocks.length)}/${blocks.length})` : "";
+						return [theme.fg("accent", "Subscription quota"), ...blocks.slice(offset, offset + height),
+							theme.fg(statusColor, status), theme.fg("dim", `r refresh · esc/q close${scroll}`)]
+							.map((line) => truncateStyled(line, Math.max(0, width)));
+					},
+					handleInput(data: string): void {
+						if (closed) return;
+						if (data === "q" || keybindings.matches(data, "tui.select.cancel")) { close(); return; }
+						if (data === "r") { void refresh(true); return; }
+						if (keybindings.matches(data, "tui.select.up")) offset--;
+						else if (keybindings.matches(data, "tui.select.down")) offset++;
+						else if (keybindings.matches(data, "tui.select.pageUp")) offset -= pageSize();
+						else if (keybindings.matches(data, "tui.select.pageDown")) offset += pageSize();
+						else return;
+						tui.requestRender();
+					},
+					invalidate() {}, // No cached themed output.
+					dispose,
+				};
+			}, { overlay: true, overlayOptions: { width: "95%", margin: 1 } });
+		} finally {
+			cleanup();
+		}
+	}
+
 	async function runQuota(ctx: ExtensionContext, silent = false): Promise<void> {
 		if (!active || (silent && !isProxyModel(ctx.model, resolveBaseUrl()))) return;
+		if (!silent && isPrimaryUiSession(ctx) && typeof ctx.ui.custom === "function") return showQuotaPanel(ctx);
 		const session = lifecycle;
 		let signal: AbortSignal | undefined;
 		if (!silent) ctx.ui.notify("Fetching quota (up to 5-minute cache)…", "info");
@@ -1974,26 +2171,12 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 			signal = AbortSignal.any(silent ? [session.signal, background.signal, connectionLifetime.signal] : [session.signal, connectionLifetime.signal]);
 			const result = await client.collect(base, key, Date.now(), signal);
 			signal.throwIfAborted();
-			if (session !== lifecycle || scope !== currentScope()) return;
-			snapshot = result.snapshot;
-			snapshotScope = scope;
+			if (!applyResult(ctx, result.snapshot, session, scope)) return;
 			if (!silent) ctx.ui.notify(`Subscription quota\n${result.blocks.join("\n")}`, "info");
-			// Quota is account-scoped, so an ongoing refresh safely renders the newly selected model.
-			updateFooter(activeCtx ?? ctx);
 		} catch (err) {
 			if (signal?.aborted || session !== lifecycle || !active) return;
-			const msg = (err as Error).message;
-			if (msg === "NO_CRED") {
-				snapshot = undefined;
-				selectedAuthIndex = null;
-				updateFooter(activeCtx ?? ctx);
-			} else if (!snapshot) updateFooter(activeCtx ?? ctx);
-			if (silent) return;
-			if (msg === "NO_KEY") {
-				ctx.ui.notify('Management key not found. Set CLIPROXYAPI_MANAGEMENT_KEY or configure ~/.pi/agent/cliproxyapi-quota.json / EasyCLIProxyAPI.', "error");
-			} else if (msg === "NO_CRED") {
-				ctx.ui.notify("No usable OAuth credential found (claude / codex / antigravity / gemini / kimi / xai / kiro).", "warning");
-			} else ctx.ui.notify(`Failed to fetch quota: ${msg}`, "error");
+			const message = quotaError(ctx, err);
+			if (!silent) ctx.ui.notify(message, (err as Error).message === "NO_CRED" ? "warning" : "error");
 		}
 	}
 
@@ -2048,6 +2231,7 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 		requestRun = undefined;
 		pendingRequest = undefined;
 		selectedAuthIndex = null;
+		lastTracedAuthIndex = null;
 		snapshot = undefined;
 		snapshotScope = undefined;
 	}
@@ -2056,6 +2240,7 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 		if (!active) return;
 		routingRevision++;
 		selectedAuthIndex = null;
+		lastTracedAuthIndex = null;
 		pendingRequest = undefined;
 		schedule(ctx, false);
 	});
@@ -2106,6 +2291,7 @@ export default function (pi: ExtensionAPI, client: QuotaClient = defaultQuotaCli
 		if (!active || !pendingRequest || pendingRequest.revision !== routingRevision || pendingRequest.modelKey !== modelKey(ctx.model) ||
 			pendingRequest.scope !== currentScope() || !isProxyModel(ctx.model, resolveBaseUrl())) return;
 		selectedAuthIndex = event.status >= 200 && event.status < 300 ? authIndexFromHeaders(event.headers) : null;
+		if (selectedAuthIndex) lastTracedAuthIndex = selectedAuthIndex;
 		updateFooter(ctx);
 		if (selectedAuthIndex && !snapshot?.routes.some((r) => r.credential.auth_index === selectedAuthIndex)) void refreshRouting(ctx, true);
 	});
